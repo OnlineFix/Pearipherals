@@ -1,19 +1,26 @@
-# MagicSuite
+# Pearipherals
 
-**Make an Apple Magic Keyboard + Magic Trackpad 2 feel at home on Windows — one portable exe, no install, free.**
+**Apple's peripherals, minus the Apple computer. Make a Magic Keyboard +
+Magic Trackpad 2 feel at home on Windows — one portable exe, no install, free.**
 
 Windows pairs Apple's Bluetooth peripherals fine, but leaves them half-broken:
 the trackpad acts as a dumb 2-button mouse and the keyboard's F-row does
-nothing Mac-like. The paid tools fix this behind a license. MagicSuite is the
-free, open-source alternative.
+nothing Mac-like. Magic in, tragic out. The paid tools fix this behind a
+license — Pearipherals is the free, open-source alternative.
 
-## What it does
+Three parts, one tray app:
 
-**Magic Keyboard — Mac-style function row**
+| | |
+|---|---|
+| **Tragic Keyboard** | Mac-style function row for the Magic Keyboard |
+| **Tragic Trackpad** | three-finger gestures the Bluetooth driver won't do |
+| **Moodio Display** | brightness for the Studio Display (and any other monitor) |
+
+## Tragic Keyboard — Mac-style function row
 
 | Key | Action |
 |-----|--------|
-| F1 / F2 | Display brightness down / up (Apple Studio Display USB → DDC/CI → software dim, first that works) |
+| F1 / F2 | Display brightness down / up (via Moodio) |
 | F3 | Task View (Mission Control) |
 | F4 | Search (Spotlight) |
 | F5 / F6 | Passthrough |
@@ -24,10 +31,10 @@ Hold **any modifier** (Ctrl/Alt/Shift/Win) to get the raw F-key —
 Alt+F4, Ctrl+F5 etc. all work unchanged. Toggle the whole layer from the
 tray icon.
 
-**Magic Trackpad — three-finger gestures that actually work**
+## Tragic Trackpad — three-finger gestures that actually work
 
 The Magic Trackpad 2's Bluetooth driver reports contacts one at a time, which
-breaks Windows' native 3-finger gesture detection entirely. MagicSuite
+breaks Windows' native 3-finger gesture detection entirely. Tragic Trackpad
 reassembles the touch data itself (Raw Input + per-contact tracking) and
 gives you a choice of 3-finger behavior from the tray:
 
@@ -43,13 +50,20 @@ Plus a **natural scrolling** toggle (note: Windows applies scroll direction
 when the trackpad connects — flip the trackpad's power switch off/on after
 toggling, or reboot).
 
-**App behavior**
+## Moodio Display — brightness that finds a way
 
-- Single portable exe, config sits next to it (`magicsuite.json`)
+F1/F2 try, in order: Apple Studio Display over USB HID, then DDC/CI for any
+normal external monitor, then GPU gamma-ramp dimming as a last resort. So the
+brightness keys do something sensible on basically any display, including
+laptop panels and monitors with no DDC support.
+
+## App behavior
+
+- Single portable exe, config sits next to it (`pearipherals.json`)
 - First run: enables autostart + applies the touchpad settings the gestures
   need (originals backed up, restorable from the tray)
 - Tray icon: every feature can be toggled or reverted; **Quit** stops everything
-- Crash-resilient: auto-retries at logon, errors logged to `magicsuite.err.log`
+- Crash-resilient: auto-retries at logon, errors logged to `pearipherals.err.log`
 - Single-instance guard — safe to double-launch
 - Moving the exe? Run it once from the new location — autostart re-points itself
 
@@ -59,20 +73,24 @@ toggling, or reboot).
 2. For the trackpad: the open-source
    [mac-precision-touchpad](https://github.com/imbushuo/mac-precision-touchpad)
    driver (signed, free) — this is what turns the trackpad into a real
-   Windows Precision Touchpad with pointer + 2-finger scrolling. MagicSuite
-   builds on top of it for everything the driver can't deliver.
+   Windows Precision Touchpad with pointer + 2-finger scrolling. Tragic
+   Trackpad builds on top of it for everything the driver can't deliver.
    The keyboard features work without any driver.
 
 ## Quick start
 
 1. Install the mac-precision-touchpad driver (trackpad only, once)
-2. Download `MagicSuite.exe` from [Releases](../../releases) and put it
+2. Download `Pearipherals.exe` from [Releases](../../releases) and put it
    anywhere (USB stick, Dropbox, `C:\Tools`, …)
 3. Run it — done. It sets up autostart and the right touchpad settings on
    first launch, and lives in your tray.
 
 > Windows SmartScreen may warn on first run (unsigned exe) — click
 > "More info" → "Run anyway". You can always build it from source instead.
+
+Upgrading from MagicSuite? Just run the new exe — it picks up your old
+`magicsuite.json` settings and cleans up the old autostart entry. Delete the
+old exe afterwards.
 
 ## Uninstall
 
@@ -84,10 +102,10 @@ defaults** → **Quit** → delete the exe. Nothing else is left behind.
 ```
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\pyinstaller --onefile --windowed --name MagicSuite --icon magicsuite.ico --hidden-import pystray._win32 magicsuite.py
+.venv\Scripts\pyinstaller --onefile --windowed --name Pearipherals --icon pearipherals.ico --hidden-import pystray._win32 pearipherals.py
 ```
 
-The exe lands in `dist\MagicSuite.exe`. Or just run `build.bat`.
+The exe lands in `dist\Pearipherals.exe`. Or just run `build.bat`.
 
 ## How it works (for the curious)
 
@@ -120,3 +138,9 @@ The exe lands in `dist\MagicSuite.exe`. Or just run `build.bat`.
 ## License
 
 MIT
+
+---
+
+Not affiliated with, endorsed by, or sponsored by Apple Inc. Apple, Magic
+Keyboard, Magic Trackpad and Studio Display are trademarks of Apple Inc.,
+used here only to describe the hardware this software supports.

@@ -1,6 +1,14 @@
-"""MagicKeys — Mac-style function row for Apple Magic Keyboard on Windows.
+"""Pearipherals — Apple's peripherals, minus the Apple computer.
 
-F1  brightness-  (external monitor via DDC/CI)
+Three parts, one tray app:
+
+  Tragic Keyboard  Mac-style function row for the Magic Keyboard
+  Tragic Trackpad  three-finger gestures the Bluetooth driver won't do
+  Moodio Display   brightness for the Studio Display (and any other monitor)
+
+F-row layout (Tragic Keyboard):
+
+F1  brightness-  (Moodio: Studio Display USB / DDC-CI / gamma)
 F2  brightness+
 F3  Task View    (Win+Tab)   — Mission Control equivalent
 F4  Search      (Win+S)      — Spotlight equivalent
@@ -16,8 +24,8 @@ F12 volume up
 Holding ANY modifier (Ctrl/Alt/Shift/Win) passes F-keys through untouched,
 so Alt+F4, Ctrl+F5, Shift+F10 keep working.
 
-Tray icon: toggle Mac F-keys, autostart, quit.
-Config: magickeys.json next to this script.
+Tray icon: toggle the F-row, pick a gesture, autostart, quit.
+Config: pearipherals.json next to this script.
 """
 import ctypes
 import ctypes.wintypes as w
@@ -35,10 +43,12 @@ if IS_FROZEN:
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "magicsuite.json")
+CONFIG_PATH = os.path.join(APP_DIR, "pearipherals.json")
+OLD_CONFIG_PATHS = (os.path.join(APP_DIR, "magicsuite.json"),
+                    os.path.join(APP_DIR, "magickeys.json"))
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "MagicSuite"
-OLD_RUN_NAMES = ("MagicKeys",)
+RUN_NAME = "Pearipherals"
+OLD_RUN_NAMES = ("MagicKeys", "MagicSuite")
 MAGIC_EXTRA = 0xA99C0DE  # tag for our own injected events
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -55,11 +65,18 @@ DEFAULTS = {"mac_fkeys": True, "brightness_step": 10,
 
 
 def load_config():
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = {**DEFAULTS, **json.load(f)}
-    except Exception:
-        cfg = dict(DEFAULTS)
+    # settings carry over from the pre-rename names (MagicSuite / MagicKeys)
+    paths = (CONFIG_PATH,) + OLD_CONFIG_PATHS
+    cfg = dict(DEFAULTS)
+    for i, path in enumerate(paths):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = {**DEFAULTS, **json.load(f)}
+        except Exception:
+            continue
+        if i:                          # loaded an old file — adopt the new one
+            save_config(cfg)
+        break
     # v3: three_finger_drag bool replaced by three_finger_mode enum, and
     # swipe synthesis introduced (old driver can't feed native swipes).
     if cfg.get("cfg_version", 1) < 3:
@@ -485,7 +502,7 @@ def worker():
                 if pct is not None:
                     osd.show(pct, brightness.last_backend)
                     if tray_icon is not None:
-                        tray_icon.title = (f"MagicKeys — brightness {pct}% "
+                        tray_icon.title = (f"Moodio — brightness {pct}% "
                                            f"({brightness.last_backend})")
         except Exception:
             pass
@@ -988,7 +1005,7 @@ class ThreeFingerDrag:
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
-        wc.lpszClassName = "MagicSuiteTFD"
+        wc.lpszClassName = "PearipheralsTFD"
         user32.RegisterClassW(ctypes.byref(wc))
         hwnd = user32.CreateWindowExW(0, wc.lpszClassName, "tfd", 0, 0, 0, 0, 0,
                                       None, None, hinst, None)
@@ -1015,7 +1032,7 @@ three_finger_drag = ThreeFingerDrag()
 
 # ---------------------------------------------------------------- touchpad settings
 class TouchpadSettings:
-    """Windows Precision Touchpad registry settings needed for MagicSuite.
+    """Windows Precision Touchpad registry settings needed by Tragic Trackpad.
 
     Backs up original values into the config JSON on first apply, so
     everything is reversible. Values take effect on next device
@@ -1154,7 +1171,7 @@ def on_autostart(icon, item):
 def set_tf_mode(mode):
     config["three_finger_mode"] = mode
     save_config(config)
-    # While MagicSuite owns the 3-finger gesture (swipes or drag), native
+    # While Tragic Trackpad owns the 3-finger gesture (swipes or drag), native
     # Windows swipes must be off — on healthy PTP drivers both would fire.
     # mode 'off' hands the gesture back to Windows.
     try:
@@ -1230,7 +1247,7 @@ def on_quit(icon, item):
 
 def main():
     global tray_icon
-    # migrate: remove old MagicKeys autostart entry if present
+    # migrate: drop autostart entries from the pre-rename names
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -1263,11 +1280,13 @@ def main():
     suppress_pointer.start()
     three_finger_drag.start()
     tray_icon = pystray.Icon(
-        "MagicSuite", make_icon(), "MagicSuite — Magic Keyboard + Trackpad",
+        "Pearipherals", make_icon(),
+        "Pearipherals — Tragic Keyboard + Tragic Trackpad",
         menu=pystray.Menu(
-            pystray.MenuItem("Mac F-keys (F1-F12 → media/brightness)", on_toggle,
+            pystray.MenuItem("Tragic Keyboard (F1-F12 → media/brightness)",
+                             on_toggle,
                              checked=lambda i: config["mac_fkeys"]),
-            pystray.MenuItem("Three-finger gesture", pystray.Menu(
+            pystray.MenuItem("Tragic Trackpad — 3-finger gesture", pystray.Menu(
                 pystray.MenuItem("Swipes (Task View / desktop / switch apps)",
                                  on_mode_swipes, radio=True,
                                  checked=lambda i: config["three_finger_mode"] == "swipes"),
@@ -1297,16 +1316,21 @@ def main():
 
 
 def _single_instance_or_exit():
-    """Named mutex so double-starts (Run key + manual) can't stack hooks."""
-    kernel32.CreateMutexW(None, False, "MagicSuite_single_instance_v2")
+    """Named mutex so double-starts (Run key + manual) can't stack hooks.
+
+    The pre-rename mutex is checked too, so upgrading over a still-running
+    MagicSuite.exe doesn't end up with two copies hooking the same keys."""
     ERROR_ALREADY_EXISTS = 183
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        os._exit(0)
+    for name in ("Pearipherals_single_instance_v1",
+                 "MagicSuite_single_instance_v2"):
+        kernel32.CreateMutexW(None, False, name)
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            os._exit(0)
 
 
 if __name__ == "__main__":
     _single_instance_or_exit()
-    log_path = os.path.join(APP_DIR, "magicsuite.err.log")
+    log_path = os.path.join(APP_DIR, "pearipherals.err.log")
     # Early-logon resilience: explorer/tray may not exist yet, displays may
     # still be initializing. Retry the whole app a few times before giving up.
     import datetime

@@ -9,5 +9,7 @@ __pycache__/
 .venv/
 
 # runtime files (live next to the exe, never in git)
+pearipherals.json
+pearipherals.err.log
 magicsuite.json
 magicsuite.err.log
