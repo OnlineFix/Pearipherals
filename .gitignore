@@ -1,0 +1,13 @@
+# build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# local environment
+.venv/
+
+# runtime files (live next to the exe, never in git)
+magicsuite.json
+magicsuite.err.log
