@@ -61,7 +61,8 @@ laptop panels and monitors with no DDC support.
 
 - Single portable exe, config sits next to it (`pearipherals.json`)
 - First run: enables autostart + applies the touchpad settings the gestures
-  need (originals backed up, restorable from the tray)
+  need (originals backed up, restorable from the tray), then says so in a
+  notification so you know what changed and where to undo it
 - Tray icon: every feature can be toggled or reverted; **Quit** stops everything
 - Crash-resilient: auto-retries at logon, errors logged to `pearipherals.err.log`
 - Single-instance guard — safe to double-launch

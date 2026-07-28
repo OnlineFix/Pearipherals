@@ -1219,9 +1219,12 @@ def first_run_setup():
 
     - enable autostart from the current location
     - apply required touchpad settings (originals backed up in config)
+
+    Returns True when this really was the first run, so the caller can
+    announce it instead of leaving the user to guess.
     """
     if config.get("setup_done"):
-        return
+        return False
     try:
         autostart_set(True)
     except Exception:
@@ -1232,6 +1235,31 @@ def first_run_setup():
         pass
     config["setup_done"] = True
     save_config(config)
+    return True
+
+
+def tray_setup(icon, first_run):
+    """pystray setup hook, run in its own thread once the loop is up.
+
+    A custom setup callback owns `visible` — pystray only sets it for you
+    when no callback is given.
+
+    First launch turns on autostart and rewrites touchpad settings without
+    asking; say so once, rather than leaving the tray icon to be discovered
+    by accident. A toast and not a dialog: this starts at logon, so nothing
+    here should steal focus.
+    """
+    icon.visible = True
+    if not first_run:
+        return
+    import time as _t
+    _t.sleep(2)                # let the tray icon register before we toast it
+    try:
+        icon.notify("Mac F-row and 3-finger swipes are on, and it now starts "
+                    "with Windows. Right-click this icon to change any of it.",
+                    "Pearipherals is running")
+    except Exception:
+        pass
 
 
 def on_quit(icon, item):
@@ -1258,7 +1286,7 @@ def main():
                     pass
     except OSError:
         pass
-    first_run_setup()
+    is_first_run = first_run_setup()
     # enforce gesture-ownership invariant every launch:
     # swipes/drag mode -> native 3-finger swipes off; off -> native on
     try:
@@ -1312,7 +1340,7 @@ def main():
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ))
-    tray_icon.run()
+    tray_icon.run(setup=lambda icon: tray_setup(icon, is_first_run))
 
 
 def _single_instance_or_exit():
