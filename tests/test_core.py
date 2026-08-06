@@ -10,7 +10,11 @@ import unittest
 from unittest import mock
 
 from pearipherals_core import (
+    BatteryPoller,
     BatteryResult,
+    BatterySnapshot,
+    BatterySnapshotStore,
+    HidBatteryBackend,
     CONFIG_LOCK,
     ConfigRecoveryRequired,
     TouchpadSettingsManager,
@@ -1019,6 +1023,418 @@ class TouchpadSettingsManagerTests(unittest.TestCase):
 
 
 class BatteryTests(unittest.TestCase):
+    @staticmethod
+    def _load_app_function(name, globals_):
+        return InputLifecycleTests._load_app_definition(name, globals_)
+
+    class FakeHidBackend:
+        def __init__(self, devices, reports):
+            self.devices = devices
+            self.reports = reports
+            self.enumerations = 0
+            self.queries = []
+
+        def enumerate_devices(self):
+            self.enumerations += 1
+            return list(self.devices)
+
+        def request_report(self, path):
+            self.queries.append(path)
+            value = self.reports[path]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def test_poll_cycle_enumerates_once_and_queries_devices_independently(self):
+        devices = [
+            {"vendor_id": 0x004C, "product_id": 0x0267,
+             "usage_page": 0xFF00, "usage": 0x14, "path": b"keyboard"},
+            {"vendor_id": 0x004C, "product_id": 0x0265,
+             "usage_page": 0xFF00, "usage": 0x14, "path": b"trackpad"},
+        ]
+        backend = self.FakeHidBackend(
+            devices,
+            {b"keyboard": b"\x90\x02\x4b", b"trackpad": OSError("asleep")},
+        )
+        published = []
+        poller = BatteryPoller(backend, published.append, clock=lambda: 10.0)
+
+        snapshot, delay = poller.poll_once()
+
+        self.assertEqual(1, backend.enumerations)
+        self.assertEqual([b"keyboard", b"trackpad"], backend.queries)
+        self.assertEqual(BatteryResult("available", 75, True, False),
+                         snapshot.keyboard)
+        self.assertEqual("unavailable", snapshot.trackpad.status)
+        self.assertIs(snapshot, published[0])
+        self.assertGreaterEqual(poller.normal_interval, 180.0)
+        self.assertGreater(poller.failure_backoff, poller.normal_interval)
+        self.assertEqual(poller.failure_backoff, delay)
+
+    def test_hid_backend_closes_every_open_handle_even_when_query_fails(self):
+        events = []
+
+        class Handle:
+            def open_path(self, path):
+                events.append(("open", path))
+
+            def get_input_report(self, report_id, length):
+                events.append(("query", report_id, length))
+                raise OSError("offline")
+
+            def close(self):
+                events.append(("close",))
+
+        hid_module = mock.Mock()
+        hid_module.device.side_effect = Handle
+        backend = HidBatteryBackend(hid_module)
+
+        with self.assertRaises(OSError):
+            backend.request_report(b"new-path")
+
+        self.assertEqual(
+            [("open", b"new-path"), ("query", 0x90, 3), ("close",)], events
+        )
+
+    def test_hid_backend_closes_handle_after_successful_query(self):
+        events = []
+
+        class Handle:
+            def open_path(self, path):
+                events.append(("open", path))
+
+            def get_input_report(self, report_id, length):
+                events.append(("query", report_id, length))
+                return b"\x90\x00\x2a"
+
+            def close(self):
+                events.append(("close",))
+
+        hid_module = mock.Mock()
+        hid_module.device.side_effect = Handle
+
+        report = HidBatteryBackend(hid_module).request_report(b"fresh-path")
+
+        self.assertEqual(b"\x90\x00\x2a", report)
+        self.assertEqual(
+            [("open", b"fresh-path"), ("query", 0x90, 3), ("close",)], events
+        )
+
+    def test_repeated_poll_cycles_reenumerate_and_use_fresh_device_paths(self):
+        paths = iter((b"keyboard-old", b"keyboard-new"))
+
+        class ChangingBackend:
+            def __init__(self):
+                self.enumerations = 0
+                self.queries = []
+
+            def enumerate_devices(self):
+                self.enumerations += 1
+                return [{
+                    "vendor_id": 0x004C,
+                    "product_id": 0x0267,
+                    "usage_page": 0xFF00,
+                    "usage": 0x14,
+                    "path": next(paths),
+                }]
+
+            def request_report(self, path):
+                self.queries.append(path)
+                return b"\x90\x00\x2a"
+
+        backend = ChangingBackend()
+        poller = BatteryPoller(backend, lambda snapshot: None)
+
+        poller.poll_once()
+        poller.poll_once()
+
+        self.assertEqual(2, backend.enumerations)
+        self.assertEqual([b"keyboard-old", b"keyboard-new"], backend.queries)
+
+    def test_snapshot_store_exposes_only_complete_immutable_snapshots(self):
+        store = BatterySnapshotStore()
+        backend = self.FakeHidBackend([], {})
+        snapshot, _ = BatteryPoller(backend, store.publish, clock=lambda: 2.0).poll_once()
+
+        self.assertIs(snapshot, store.snapshot())
+        with self.assertRaises((AttributeError, TypeError)):
+            snapshot.keyboard = BatteryResult("available", 1)
+
+    def test_failed_reading_becomes_explicitly_stale_without_false_current_percent(self):
+        now = [0.0]
+        devices = [
+            {"vendor_id": 0x004C, "product_id": 0x0267,
+             "usage_page": 0xFF00, "usage": 0x14, "path": b"keyboard"},
+        ]
+        backend = self.FakeHidBackend(devices, {b"keyboard": b"\x90\x04\x50"})
+        poller = BatteryPoller(
+            backend, lambda snapshot: None, clock=lambda: now[0], stale_after=600.0
+        )
+        first, _ = poller.poll_once()
+        self.assertEqual(80, first.keyboard.percentage)
+
+        backend.reports[b"keyboard"] = OSError("offline")
+        now[0] = 300.0
+        recent_failure, _ = poller.poll_once()
+        self.assertEqual("unavailable", recent_failure.keyboard.status)
+        self.assertFalse(recent_failure.keyboard.stale)
+        self.assertIsNone(recent_failure.keyboard.percentage)
+
+        now[0] = 601.0
+        stale, _ = poller.poll_once()
+        self.assertEqual("unavailable", stale.keyboard.status)
+        self.assertTrue(stale.keyboard.stale)
+        self.assertIsNone(stale.keyboard.percentage)
+        self.assertEqual(80, stale.keyboard.last_percentage)
+        self.assertEqual(
+            "Magic Keyboard battery: unavailable; last known 80% (stale)",
+            format_battery_label("Magic Keyboard", stale.keyboard),
+        )
+
+    def test_worker_shutdown_interrupts_long_backoff_wait_cleanly(self):
+        published = threading.Event()
+        stop = threading.Event()
+        backend = self.FakeHidBackend([], {})
+        poller = BatteryPoller(
+            backend,
+            lambda snapshot: published.set(),
+            normal_interval=180.0,
+            failure_backoff=900.0,
+        )
+        thread = threading.Thread(target=poller.run, args=(stop,))
+        thread.start()
+        self.assertTrue(published.wait(1.0))
+
+        stop.set()
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(1, backend.enumerations)
+
+    def test_all_nonvalid_states_have_distinct_dynamic_labels(self):
+        labels = {
+            status: format_battery_label("Magic Trackpad", BatteryResult(status))
+            for status in ("loading", "not_detected", "unavailable", "unsupported")
+        }
+
+        self.assertEqual(4, len(set(labels.values())))
+        self.assertIn("loading", labels["loading"])
+        self.assertIn("not detected", labels["not_detected"])
+        self.assertIn("unavailable", labels["unavailable"])
+        self.assertIn("unsupported report", labels["unsupported"])
+
+    def test_dynamic_tray_labels_read_one_immutable_snapshot(self):
+        snapshot = BatterySnapshot(
+            BatteryResult("available", 91), BatteryResult("not_detected"), 12.0
+        )
+        store = mock.Mock(snapshot=mock.Mock(return_value=snapshot))
+        label = self._load_app_function(
+            "battery_menu_label",
+            {
+                "battery_snapshots": store,
+                "format_battery_label": format_battery_label,
+            },
+        )
+
+        self.assertEqual("Magic Keyboard battery: 91%", label("keyboard"))
+        self.assertEqual(
+            "Magic Trackpad battery: not detected", label("trackpad")
+        )
+        self.assertEqual(2, store.snapshot.call_count)
+
+    def test_each_complete_publication_requests_a_tray_refresh(self):
+        store = mock.Mock()
+        dispatcher = mock.Mock()
+        publish = self._load_app_function(
+            "publish_battery_snapshot",
+            {
+                "battery_snapshots": store,
+                "battery_menu_refresh": dispatcher,
+            },
+        )
+        states = (
+            BatteryResult("available", 88),
+            BatteryResult("available", 89, charging=True),
+            BatteryResult("not_detected"),
+            BatteryResult("unsupported"),
+            BatteryResult("unavailable"),
+            BatteryResult("unavailable", stale=True, last_percentage=89),
+        )
+
+        for index, state in enumerate(states):
+            snapshot = BatterySnapshot(state, BatteryResult("loading"), float(index))
+            publish(snapshot)
+            self.assertIs(snapshot, store.publish.call_args.args[0])
+            self.assertEqual(index + 1, dispatcher.schedule.call_count)
+
+    def test_post_message_declaration_preserves_high_bit_hwnd_on_x64(self):
+        self.assertEqual(8, ctypes.sizeof(ctypes.c_void_p))
+        received = []
+        callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        callback = callback_type(
+            lambda hwnd, message, wparam, lparam: received.append(hwnd) or 1
+        )
+
+        class PostMessageFunction(ctypes._CFuncPtr):
+            _flags_ = ctypes._FUNCFLAG_STDCALL
+            _restype_ = wintypes.BOOL
+
+        post_message = PostMessageFunction(
+            ctypes.cast(callback, ctypes.c_void_p).value
+        )
+        high_bit_hwnd = (1 << 63) | 0x1234
+
+        with self.assertRaises(ctypes.ArgumentError):
+            post_message(high_bit_hwnd, 0x8000, 0, 0)
+        self.assertEqual([], received)
+
+        post_message.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        post_message.restype = wintypes.BOOL
+        self.assertTrue(post_message(high_bit_hwnd, 0x8000, 0, 0))
+        self.assertEqual([high_bit_hwnd], received)
+
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        self.assertIn(
+            "user32.PostMessageW.argtypes = (w.HWND, w.UINT, w.WPARAM, w.LPARAM)",
+            source,
+        )
+        self.assertIn("user32.PostMessageW.restype = w.BOOL", source)
+
+    def test_windows_dispatcher_coalesces_worker_posts_and_rebuilds_on_ui_context(self):
+        posted = []
+        update_threads = []
+
+        class Icon:
+            _hwnd = 123
+
+            def __init__(self):
+                self._message_handlers = {}
+
+            def update_menu(self):
+                update_threads.append(threading.get_ident())
+
+        icon = Icon()
+        dispatcher_type = InputLifecycleTests._load_app_definition(
+            "WindowsTrayMenuRefreshDispatcher", {"threading": threading}
+        )
+        dispatcher = dispatcher_type(
+            icon,
+            post_message=lambda hwnd, message, wp, lp: posted.append(
+                (hwnd, message, wp, lp, threading.get_ident())
+            ) or 1,
+        )
+        dispatcher.start()
+        worker_id = []
+
+        def publish_burst():
+            worker_id.append(threading.get_ident())
+            for _ in range(20):
+                dispatcher.schedule()
+
+        worker = threading.Thread(target=publish_burst)
+        worker.start()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(1, len(posted))
+        self.assertEqual(worker_id[0], posted[0][4])
+        self.assertEqual([], update_threads)
+
+        ui_id = threading.get_ident()
+        icon._message_handlers[dispatcher.message](0, 0)
+        self.assertEqual([ui_id], update_threads)
+
+        dispatcher.schedule()
+        self.assertEqual(2, len(posted))
+
+    def test_windows_dispatcher_shutdown_drops_pending_refresh_safely(self):
+        updates = []
+
+        class Icon:
+            _hwnd = 456
+
+            def __init__(self):
+                self._message_handlers = {}
+
+            def update_menu(self):
+                updates.append("updated")
+
+        icon = Icon()
+        posts = []
+        dispatcher_type = InputLifecycleTests._load_app_definition(
+            "WindowsTrayMenuRefreshDispatcher", {"threading": threading}
+        )
+        dispatcher = dispatcher_type(
+            icon,
+            post_message=lambda *args: posts.append(args) or 1,
+        )
+        dispatcher.start()
+        dispatcher.schedule()
+        dispatcher.close()
+
+        icon._message_handlers[dispatcher.message](0, 0)
+        self.assertEqual([], updates)
+        self.assertFalse(dispatcher.schedule())
+        self.assertEqual(1, len(posts))
+
+    def test_app_stop_battery_worker_signals_and_joins_live_worker(self):
+        events = []
+
+        class Stop:
+            def set(self):
+                events.append("set")
+
+        class Thread:
+            def join(self, timeout):
+                events.append(("join", timeout))
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        stop_worker = self._load_app_function(
+            "stop_battery_worker",
+            {
+                "battery_stop": Stop(),
+                "battery_thread": Thread(),
+                "append_error": lambda message: events.append(message),
+            },
+        )
+
+        self.assertTrue(stop_worker(timeout=0.25))
+        self.assertEqual(["set", ("join", 0.25)], events)
+        self.assertIsNone(stop_worker.__globals__["battery_thread"])
+
+    def test_app_starts_isolated_battery_worker_and_stops_it_before_exit(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        self.assertIn("BatteryPoller(", source)
+        self.assertIn("HidBatteryBackend(hidapi)", source)
+        self.assertIn("target=battery_poller.run", source)
+        self.assertIn("battery_stop.set()", source)
+        self.assertIn("battery_thread.join(", source)
+        self.assertIn('battery_menu_label("keyboard")', source)
+        self.assertIn('battery_menu_label("trackpad")', source)
+        worker_section = source[source.index("def start_battery_worker"):source.index(
+            "def stop_battery_worker"
+        )]
+        self.assertNotIn("update_menu", worker_section)
+
     def test_parse_valid_battery_report_and_status_bits(self):
         reading = parse_apple_battery_report(bytes((0x90, 0x06, 78)))
 

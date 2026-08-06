@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -176,6 +177,52 @@ class BatteryResult:
     percentage: int | None = None
     charging: bool = False
     fully_charged: bool = False
+    stale: bool = False
+    last_percentage: int | None = None
+
+
+@dataclass(frozen=True)
+class BatterySnapshot:
+    keyboard: BatteryResult
+    trackpad: BatteryResult
+    captured_at: float
+
+
+class BatterySnapshotStore:
+    """Publish complete immutable battery snapshots across threads."""
+
+    def __init__(self):
+        loading = BatteryResult("loading")
+        self._snapshot = BatterySnapshot(loading, loading, 0.0)
+        self._lock = threading.Lock()
+
+    def publish(self, snapshot):
+        if not isinstance(snapshot, BatterySnapshot):
+            raise TypeError("battery update must be a BatterySnapshot")
+        with self._lock:
+            self._snapshot = snapshot
+
+    def snapshot(self):
+        with self._lock:
+            return self._snapshot
+
+
+class HidBatteryBackend:
+    """Small injected hidapi adapter with one handle lifetime per query."""
+
+    def __init__(self, hid_module):
+        self._hid = hid_module
+
+    def enumerate_devices(self):
+        return self._hid.enumerate()
+
+    def request_report(self, path):
+        handle = self._hid.device()
+        try:
+            handle.open_path(path)
+            return bytes(handle.get_input_report(0x90, 3))
+        finally:
+            handle.close()
 
 
 def parse_apple_battery_report(report):
@@ -237,11 +284,91 @@ def format_battery_label(device_name, result):
             suffix = " (charging)"
         return f"{prefix}{result.percentage}%{suffix}"
     labels = {
+        "loading": "loading",
         "not_detected": "not detected",
         "unavailable": "unavailable",
         "unsupported": "unsupported report",
     }
-    return prefix + labels.get(result.status, "unavailable")
+    label = prefix + labels.get(result.status, "unavailable")
+    if result.stale and result.last_percentage is not None:
+        label += f"; last known {result.last_percentage}% (stale)"
+    return label
+
+
+class BatteryPoller:
+    """Slow two-device battery poller with injected HID and timing seams."""
+
+    KEYBOARD_PID = 0x0267
+    TRACKPAD_PID = 0x0265
+
+    def __init__(
+        self,
+        backend,
+        publish,
+        clock=time.monotonic,
+        normal_interval=300.0,
+        failure_backoff=900.0,
+        stale_after=600.0,
+    ):
+        if normal_interval < 180.0:
+            raise ValueError("normal battery polling must be multi-minute")
+        if failure_backoff <= normal_interval:
+            raise ValueError("failure backoff must exceed normal polling")
+        self.backend = backend
+        self.publish = publish
+        self.clock = clock
+        self.normal_interval = float(normal_interval)
+        self.failure_backoff = float(failure_backoff)
+        self.stale_after = float(stale_after)
+        self._last_valid = {}
+
+    def _with_stale_state(self, device, result, now):
+        if result.status == "available":
+            self._last_valid[device] = (result.percentage, now)
+            return result
+        previous = self._last_valid.get(device)
+        if previous is None or now - previous[1] < self.stale_after:
+            return result
+        return BatteryResult(
+            status=result.status,
+            stale=True,
+            last_percentage=previous[0],
+        )
+
+    def poll_once(self):
+        now = self.clock()
+        try:
+            devices = list(self.backend.enumerate_devices() or [])
+        except Exception:
+            keyboard = trackpad = BatteryResult("unavailable")
+        else:
+            enumerate_cycle = lambda: devices
+            keyboard = query_apple_battery(
+                self.KEYBOARD_PID, enumerate_cycle, self.backend.request_report
+            )
+            trackpad = query_apple_battery(
+                self.TRACKPAD_PID, enumerate_cycle, self.backend.request_report
+            )
+        keyboard = self._with_stale_state("keyboard", keyboard, now)
+        trackpad = self._with_stale_state("trackpad", trackpad, now)
+        snapshot = BatterySnapshot(keyboard, trackpad, now)
+        self.publish(snapshot)
+        delay = (
+            self.normal_interval
+            if keyboard.status == trackpad.status == "available"
+            else self.failure_backoff
+        )
+        return snapshot, delay
+
+    def run(self, stop_event):
+        """Poll until shutdown; Event.wait makes even long backoff interruptible."""
+        while not stop_event.is_set():
+            try:
+                _, delay = self.poll_once()
+            except Exception:
+                delay = self.failure_backoff
+            if stop_event.wait(delay):
+                break
 
 
 def contacts_are_stable(entries, now, fresh, min_age):

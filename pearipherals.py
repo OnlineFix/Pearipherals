@@ -40,11 +40,17 @@ import pystray
 from PIL import Image, ImageDraw
 
 from pearipherals_core import (
+    BatteryPoller,
+    BatteryResult,
+    BatterySnapshot,
+    BatterySnapshotStore,
     CONFIG_LOCK,
     ConfigRecoveryRequired,
+    HidBatteryBackend,
     TouchpadSettingsManager,
     contacts_are_stable,
     expire_stale_contacts,
+    format_battery_label,
     is_target_trackpad_path,
     load_json_config,
     read_optional_value,
@@ -87,6 +93,8 @@ user32.CreateWindowExW.argtypes = (
     w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID,
 )
 user32.CreateWindowExW.restype = w.HWND
+user32.PostMessageW.argtypes = (w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+user32.PostMessageW.restype = w.BOOL
 
 # ---------------------------------------------------------------- config
 DEFAULTS = {"mac_fkeys": True, "brightness_step": 10,
@@ -1542,6 +1550,137 @@ def autostart_set(enable):
 
 
 # ---------------------------------------------------------------- tray
+class WindowsTrayMenuRefreshDispatcher:
+    """Marshal coalesced menu rebuilds onto pystray's Win32 message loop.
+
+    pystray 0.19.5 exposes its HWND and message-handler table on the Windows
+    backend. Posting one private WM_APP message lets the HID worker request a
+    rebuild without running any pystray code itself.
+    """
+
+    WM_APP = 0x8000
+    message = WM_APP + 0x4D5
+
+    def __init__(self, icon, post_message):
+        self._icon = icon
+        self._post_message = post_message
+        self._lock = threading.Lock()
+        self._started = False
+        self._pending = False
+        self._closed = False
+
+    def start(self):
+        """Attach the callback after pystray has created its tray HWND."""
+        with self._lock:
+            if self._closed:
+                return False
+            if self._started:
+                return True
+            if self._icon._hwnd is None:
+                raise RuntimeError("pystray tray window is not ready")
+            self._icon._message_handlers[self.message] = self._on_refresh
+            self._started = True
+            return True
+
+    def schedule(self):
+        """Post at most one outstanding refresh message from any thread."""
+        with self._lock:
+            if self._closed or not self._started or self._pending:
+                return False
+            self._pending = True
+            hwnd = self._icon._hwnd
+        try:
+            posted = self._post_message(hwnd, self.message, 0, 0)
+        except Exception:
+            posted = False
+        if posted:
+            return True
+        with self._lock:
+            self._pending = False
+        return False
+
+    def _on_refresh(self, wparam, lparam):
+        """Run by pystray's window procedure on the tray/UI thread."""
+        with self._lock:
+            if self._closed:
+                self._pending = False
+                return
+            self._pending = False
+        try:
+            self._icon.update_menu()
+        except Exception:
+            pass
+
+    def close(self):
+        """Prevent new posts and make an already-posted callback a no-op."""
+        with self._lock:
+            self._closed = True
+            self._pending = False
+
+
+battery_snapshots = BatterySnapshotStore()
+battery_stop = threading.Event()
+battery_thread = None
+battery_poller = None
+battery_menu_refresh = None
+
+
+def publish_battery_snapshot(snapshot):
+    """Atomically publish battery state, then request a tray-thread rebuild."""
+    battery_snapshots.publish(snapshot)
+    if battery_menu_refresh is not None:
+        battery_menu_refresh.schedule()
+
+
+def battery_menu_label(device):
+    """Read a complete snapshot when pystray evaluates a dynamic menu title."""
+    snapshot = battery_snapshots.snapshot()
+    if device == "keyboard":
+        return format_battery_label("Magic Keyboard", snapshot.keyboard)
+    if device == "trackpad":
+        return format_battery_label("Magic Trackpad", snapshot.trackpad)
+    raise ValueError(f"unknown battery device: {device}")
+
+
+def start_battery_worker():
+    """Start isolated slow HID polling; never call pystray from this worker."""
+    global battery_stop, battery_thread, battery_poller
+    if battery_thread is not None and battery_thread.is_alive():
+        return
+    battery_stop = threading.Event()
+    try:
+        import hid as hidapi
+        battery_poller = BatteryPoller(
+            HidBatteryBackend(hidapi), publish_battery_snapshot
+        )
+    except Exception as exc:
+        unavailable = BatteryResult("unavailable")
+        publish_battery_snapshot(
+            BatterySnapshot(unavailable, unavailable, time.monotonic())
+        )
+        append_error(f"Battery worker startup failed: {exc}")
+        return
+    battery_thread = threading.Thread(
+        target=battery_poller.run, args=(battery_stop,), daemon=True,
+        name="PearipheralsBattery",
+    )
+    battery_thread.start()
+
+
+def stop_battery_worker(timeout=2.0):
+    """Interrupt polling sleep and bound shutdown if hidapi is in a system call."""
+    global battery_thread
+    battery_stop.set()
+    if battery_thread is None:
+        return True
+    battery_thread.join(timeout)
+    if battery_thread.is_alive():
+        append_error("Battery worker did not stop before the shutdown deadline")
+        return False
+    battery_thread = None
+    return True
+
+
 def make_icon():
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -1711,6 +1850,10 @@ def tray_setup(icon, first_run):
     here should steal focus.
     """
     icon.visible = True
+    battery_menu_refresh.start()
+    # Starting after the Win32 HWND exists guarantees the initial loading ->
+    # first result transition can be marshalled back to the tray message loop.
+    start_battery_worker()
     if CONFIG_RECOVERY_ERROR is not None:
         _notify(
             icon,
@@ -1734,12 +1877,15 @@ def tray_setup(icon, first_run):
 
 def on_quit(icon, item):
     actions.put(None)
+    if battery_menu_refresh is not None:
+        battery_menu_refresh.close()
     shutdown_errors = shutdown_custom_input(
         three_finger_drag.abort_gesture,
         lambda: suppress_pointer.set(False),
         suppress_pointer.shutdown,
         retry_release=three_finger_drag.release_pending_button,
     )
+    stop_battery_worker()
     if shutdown_errors:
         detail = "; ".join(str(error) for error in shutdown_errors)
         _notify(icon, detail, "Input release failed on Quit")
@@ -1762,7 +1908,7 @@ def on_quit(icon, item):
 
 
 def main():
-    global tray_icon
+    global tray_icon, battery_menu_refresh
     # Migrate old autostart names only when the primary config is trustworthy.
     if CONFIG_RECOVERY_ERROR is None:
         try:
@@ -1815,6 +1961,13 @@ def main():
             pystray.MenuItem("Natural scrolling", on_natural_scroll,
                              checked=lambda i: tp_settings.natural_scroll_get()),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                lambda item: battery_menu_label("keyboard"),
+                None, enabled=False),
+            pystray.MenuItem(
+                lambda item: battery_menu_label("trackpad"),
+                None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Touchpad settings", pystray.Menu(
                 pystray.MenuItem(
                     lambda item: f"Status: {tp_settings.status_text()}",
@@ -1827,6 +1980,9 @@ def main():
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ))
+    battery_menu_refresh = WindowsTrayMenuRefreshDispatcher(
+        tray_icon, user32.PostMessageW
+    )
     tray_icon.run(setup=lambda icon: tray_setup(icon, is_first_run))
 
 
