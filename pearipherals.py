@@ -34,9 +34,28 @@ import os
 import queue
 import sys
 import threading
+import time
 
 import pystray
 from PIL import Image, ImageDraw
+
+from pearipherals_core import (
+    CONFIG_LOCK,
+    ConfigRecoveryRequired,
+    TouchpadSettingsManager,
+    contacts_are_stable,
+    expire_stale_contacts,
+    is_target_trackpad_path,
+    load_json_config,
+    read_optional_value,
+    release_custom_input,
+    require_single_input,
+    run_input_callback,
+    save_json_atomic,
+    set_managed_mode,
+    should_suppress_pointer,
+    shutdown_custom_input,
+)
 
 IS_FROZEN = getattr(sys, "frozen", False)
 if IS_FROZEN:
@@ -44,6 +63,7 @@ if IS_FROZEN:
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "pearipherals.json")
+ERROR_LOG_PATH = os.path.join(APP_DIR, "pearipherals.err.log")
 OLD_CONFIG_PATHS = (os.path.join(APP_DIR, "magicsuite.json"),
                     os.path.join(APP_DIR, "magickeys.json"))
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -55,51 +75,98 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
 
+# Pointer-sized Win32 results must be declared explicitly on x64. ctypes
+# otherwise defaults to c_int and can truncate valid HWND/HMODULE handles.
+kernel32.GetModuleHandleW.argtypes = (w.LPCWSTR,)
+kernel32.GetModuleHandleW.restype = w.HMODULE
+kernel32.CreateMutexW.argtypes = (w.LPVOID, w.BOOL, w.LPCWSTR)
+kernel32.CreateMutexW.restype = w.HANDLE
+user32.CreateWindowExW.argtypes = (
+    w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID,
+)
+user32.CreateWindowExW.restype = w.HWND
+
 # ---------------------------------------------------------------- config
 DEFAULTS = {"mac_fkeys": True, "brightness_step": 10,
             "three_finger_mode": "swipes",   # swipes | drag | off
             "drag_gain": 0.75, "drag_grace_ms": 350, "drag_start_units": 30,
             "swipe_units": 300,
             "natural_scroll": False,   # False = swipe down scrolls down (wheel style)
-            "cfg_version": 4}
+            "tp_settings_applied": False,
+            "cfg_version": 5}
+
+CONFIG_RECOVERY_ERROR = None
+_ERROR_LOG_LOCK = threading.Lock()
 
 
-def load_config():
-    # settings carry over from the pre-rename names (MagicSuite / MagicKeys)
-    paths = (CONFIG_PATH,) + OLD_CONFIG_PATHS
-    cfg = dict(DEFAULTS)
-    for i, path in enumerate(paths):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = {**DEFAULTS, **json.load(f)}
-        except Exception:
-            continue
-        if i:                          # loaded an old file — adopt the new one
-            save_config(cfg)
-        break
-    # v3: three_finger_drag bool replaced by three_finger_mode enum, and
-    # swipe synthesis introduced (old driver can't feed native swipes).
-    if cfg.get("cfg_version", 1) < 3:
-        cfg.pop("three_finger_drag", None)
-        cfg["three_finger_mode"] = "swipes"
-    # v4: scroll direction handled by our own instant inversion layer
-    # (Windows only reads ScrollDirection at logon — useless as a toggle).
-    if cfg.get("cfg_version", 1) < 4:
-        cfg["natural_scroll"] = False
-        cfg["cfg_version"] = 4
-        save_config(cfg)
-    return cfg
-
-
-def save_config(cfg):
+def append_error(message):
+    """Best-effort thread-safe error logging for background Win32 callbacks."""
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+        with _ERROR_LOG_LOCK:
+            with open(ERROR_LOG_PATH, "a", encoding="utf-8") as stream:
+                stream.write(
+                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+                )
     except Exception:
         pass
 
 
-config = load_config()
+def config_value(key, default=None):
+    with CONFIG_LOCK:
+        return config.get(key, default)
+
+
+def load_config():
+    # settings carry over from the pre-rename names (MagicSuite / MagicKeys)
+    with CONFIG_LOCK:
+        cfg, state = load_json_config(CONFIG_PATH, DEFAULTS)
+        if state == "missing":
+            for path in OLD_CONFIG_PATHS:
+                try:
+                    candidate, old_state = load_json_config(path, DEFAULTS)
+                except ConfigRecoveryRequired:
+                    continue
+                if old_state == "loaded":
+                    cfg = candidate
+                    save_config(cfg)  # adopt a valid old file under the new name
+                    break
+        # v3: three_finger_drag bool replaced by three_finger_mode enum, and
+        # swipe synthesis introduced (old driver can't feed native swipes).
+        if cfg.get("cfg_version", 1) < 3:
+            cfg.pop("three_finger_drag", None)
+            cfg["three_finger_mode"] = "swipes"
+        # v4 added an explicit scroll-direction preference.
+        if cfg.get("cfg_version", 1) < 4:
+            cfg["natural_scroll"] = False
+        # v5 makes Apply/Restore state explicit. An old non-empty backup means
+        # the app was still managing those values; an empty backup means they
+        # had been restored (or no values ever needed changing).
+        if cfg.get("cfg_version", 1) < 5:
+            cfg["tp_settings_applied"] = bool(cfg.get("tp_settings_backup"))
+            cfg["cfg_version"] = 5
+            save_config(cfg)
+        return cfg
+
+
+def save_config(cfg):
+    with CONFIG_LOCK:
+        if CONFIG_RECOVERY_ERROR is not None:
+            raise CONFIG_RECOVERY_ERROR
+        save_json_atomic(CONFIG_PATH, cfg)
+
+
+try:
+    config = load_config()
+except ConfigRecoveryRequired as exc:
+    CONFIG_RECOVERY_ERROR = exc
+    config = {
+        **DEFAULTS,
+        "three_finger_mode": "off",
+        "tp_settings_applied": False,
+    }
+    append_error(f"Config recovery required: {exc}")
 
 # ---------------------------------------------------------------- SendInput
 ULONG_PTR = ctypes.c_size_t
@@ -378,8 +445,9 @@ class GammaBrightness:
             self.gdi32.DeleteDC(hdc)
         if ok:
             self.level = level
-            config["gamma_level"] = level
-            save_config(config)
+            with CONFIG_LOCK:
+                config["gamma_level"] = level
+                save_config(config)
         return ok
 
     def step(self, delta):
@@ -537,6 +605,11 @@ user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, w.HINSTANCE, w.DWOR
 user32.SetWindowsHookExW.restype = w.HHOOK
 user32.CallNextHookEx.argtypes = (w.HHOOK, ctypes.c_int, w.WPARAM, ctypes.c_longlong)
 user32.CallNextHookEx.restype = ctypes.c_longlong
+user32.UnhookWindowsHookEx.argtypes = (w.HHOOK,)
+user32.UnhookWindowsHookEx.restype = w.BOOL
+user32.PostThreadMessageW.argtypes = (w.DWORD, w.UINT, w.WPARAM, w.LPARAM)
+user32.PostThreadMessageW.restype = w.BOOL
+kernel32.GetCurrentThreadId.restype = w.DWORD
 
 # F-key -> action table
 ACTIONS = {
@@ -555,7 +628,7 @@ ACTIONS = {
 
 @HOOKPROC
 def ll_hook(nCode, wParam, lParam):
-    if nCode == 0 and config["mac_fkeys"]:
+    if nCode == 0 and config_value("mac_fkeys"):
         kb = ctypes.cast(ctypes.c_void_p(lParam), ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         vk = kb.vkCode
         if VK_F1 <= vk <= VK_F12 and vk in ACTIONS \
@@ -565,7 +638,8 @@ def ll_hook(nCode, wParam, lParam):
             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 kind, arg = ACTIONS[vk]
                 if kind == "bright":
-                    delta = -config["brightness_step"] if vk == 0x70 else config["brightness_step"]
+                    step = config_value("brightness_step")
+                    delta = -step if vk == 0x70 else step
                     actions.put(("bright", delta))
                 else:
                     actions.put((kind, arg))
@@ -585,18 +659,21 @@ def hook_thread():
 
 # ---------------------------------------------------------------- pointer suppressor
 class PointerSuppressor:
-    """Low-level mouse hook that swallows MOVE/WHEEL while 3 fingers are on
-    the pad. The 2021 AmtPtp driver leaks 3-finger motion into the pointer
-    stream; without this the cursor wanders during swipes. Our own SendInput
-    events carry MAGIC_EXTRA and always pass."""
+    """Install the global mouse hook only during a confirmed 3-finger touch.
+
+    A Python WH_MOUSE_LL callback is synchronous with system pointer delivery.
+    Leaving it installed while idle made every ordinary mouse move cross the
+    Python process and could add jitter even when gesture mode was off.
+    """
 
     WH_MOUSE_LL = 14
     WM_MOUSEMOVE = 0x0200
     WM_MOUSEWHEEL = 0x020A
     WM_MOUSEHWHEEL = 0x020E
+    WM_QUIT = 0x0012
+    WM_INSTALL = 0x8001
+    WM_UNINSTALL = 0x8002
     LLMHF_INJECTED = 0x01
-    MOUSEEVENTF_WHEEL = 0x0800
-    MOUSEEVENTF_HWHEEL = 0x1000
 
     class MSLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [("pt", w.POINT), ("mouseData", w.DWORD), ("flags", w.DWORD),
@@ -604,25 +681,224 @@ class PointerSuppressor:
 
     def __init__(self):
         self._active = False
+        self._requested_active = False
         self._proc = None
-        self._ncontacts = 0      # fingers currently on the trackpad
-        self._train_until = 0.0  # momentum-scroll train window
+        self._hook = None
+        self._thread = None
+        self._thread_id = 0
+        self._ready = threading.Event()
+        self._operation_done = threading.Event()
+        self._operation_error = None
+        self._operation_generation = 0
+        self._request_generation = 0
+        self._request_deadline = None
+        self._lock = threading.Lock()
 
     def set(self, active):
-        self._active = active
+        active = bool(active)
+        if active:
+            self.start()
+            self._request_hook_change(True)
+            return
+
+        with self._lock:
+            self._requested_active = False
+            self._request_generation += 1
+            if self._hook is None:
+                self._active = False
+                return
+            thread_available = (
+                self._thread is not None
+                and self._thread.is_alive()
+                and self._thread_id
+            )
+        if not thread_available:
+            for _ in range(3):
+                if self._uninstall_hook():
+                    return
+            raise OSError("UnhookWindowsHookEx failed after bounded retries")
+        self._request_hook_change(False)
 
     def set_contacts(self, n):
+        # Kept for diagnostics; hook activation is based on qualified contacts.
         self._ncontacts = n
 
-    def _reinject_wheel(self, horizontal, delta):
-        inp = INPUT()
-        inp.type = 0  # INPUT_MOUSE
-        flags = self.MOUSEEVENTF_HWHEEL if horizontal else self.MOUSEEVENTF_WHEEL
-        inp.u.mi = MOUSEINPUT(0, 0, ctypes.c_ulong(delta & 0xFFFFFFFF).value,
-                              flags, 0, MAGIC_EXTRA)
-        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-
     def start(self):
+        with self._lock:
+            if (
+                self._thread is not None
+                and self._thread.is_alive()
+                and self._thread_id
+            ):
+                return
+            if self._thread is not None and self._thread.is_alive():
+                # A prior readiness wait timed out. Re-wait the same thread;
+                # spawning a duplicate could leave two message loops/hooks.
+                thread = self._thread
+            else:
+                self._thread = None
+                self._thread_id = 0
+                self._ready.clear()
+                thread = threading.Thread(target=self._run, daemon=True)
+                self._thread = thread
+                thread.start()
+        ready = self._ready.wait(1.0)
+        with self._lock:
+            alive = thread.is_alive()
+            if not ready or not alive or not self._thread_id:
+                self._requested_active = False
+                if self._hook is None:
+                    self._active = False
+                if not alive and self._thread is thread:
+                    self._thread = None
+                raise OSError("pointer suppressor hook thread did not become ready")
+
+    def _install_hook(self, request_generation=None):
+        with self._lock:
+            if request_generation is None:
+                request_generation = self._request_generation
+        hook = user32.SetWindowsHookExW(
+            self.WH_MOUSE_LL, self._proc, None, 0
+        )
+        with self._lock:
+            if not hook:
+                if self._request_generation == request_generation:
+                    self._requested_active = False
+                    self._active = False
+                return False
+            still_requested = (
+                self._request_generation == request_generation
+                and self._requested_active
+                and self._hook is None
+                and (
+                    self._request_deadline is None
+                    or time.monotonic() <= self._request_deadline
+                )
+            )
+            if still_requested:
+                self._hook = hook
+                self._active = True
+                return True
+
+        # SetWindowsHookExW may finish after its caller timed out or a newer
+        # enable/disable request took ownership. Never publish that stale hook
+        # active; remove it immediately. If removal fails, retain the handle so
+        # bounded disable/shutdown retries can still remove it later.
+        if not user32.UnhookWindowsHookEx(hook):
+            with self._lock:
+                if self._hook is None:
+                    self._hook = hook
+                    self._active = False
+        return False
+
+    def _uninstall_hook(self):
+        with self._lock:
+            hook = self._hook
+        if hook is None:
+            with self._lock:
+                self._active = False
+            return True
+        if not user32.UnhookWindowsHookEx(hook):
+            # A failed unhook is still installed. Retain the handle and active
+            # state so a later bounded disable/shutdown attempt can retry it.
+            return False
+        with self._lock:
+            if self._hook == hook:
+                self._hook = None
+                self._active = False
+        return True
+
+    def _request_hook_change(self, active):
+        attempts = 1 if active else 3
+        last_error = None
+        with self._lock:
+            thread = self._thread
+            thread_id = self._thread_id
+            if not thread_id or thread is None or not thread.is_alive():
+                if active and self._hook is None:
+                    self._active = False
+                raise OSError("pointer suppressor hook thread is unavailable")
+            self._request_generation += 1
+            request_generation = self._request_generation
+            self._requested_active = active
+        for _ in range(attempts):
+            with self._lock:
+                self._operation_error = None
+                self._operation_done.clear()
+                deadline = time.monotonic() + 1.0
+                self._request_deadline = deadline if active else None
+            if not user32.PostThreadMessageW(
+                thread_id,
+                self.WM_INSTALL if active else self.WM_UNINSTALL,
+                request_generation,
+                0,
+            ):
+                last_error = OSError(
+                    ctypes.get_last_error(), "PostThreadMessageW failed"
+                )
+                with self._lock:
+                    if active and self._request_generation == request_generation:
+                        self._request_generation += 1
+                        self._requested_active = False
+                        if self._hook is None:
+                            self._active = False
+                break
+            while True:
+                completed = self._operation_done.wait(
+                    max(0.0, deadline - time.monotonic())
+                )
+                with self._lock:
+                    completion_owned = (
+                        self._operation_generation == request_generation
+                    )
+                    superseded = self._request_generation != request_generation
+                if not completed or completion_owned or superseded:
+                    break
+                # A stale operation completed after this request cleared the
+                # shared event. Ignore that wakeup without extending the bound.
+                self._operation_done.clear()
+            with self._lock:
+                operation_error = (
+                    self._operation_error if completion_owned else None
+                )
+                state_matches = (
+                    self._hook is not None and self._active
+                    if active else self._hook is None
+                )
+                thread_alive = self._thread is thread and thread.is_alive()
+            if (completed and completion_owned and operation_error is None
+                    and state_matches):
+                return
+            if operation_error is not None:
+                last_error = operation_error
+            elif not completed:
+                last_error = OSError("pointer suppressor hook operation timed out")
+            elif superseded:
+                last_error = OSError("pointer suppressor hook request was superseded")
+            elif not thread_alive:
+                last_error = OSError("pointer suppressor hook thread exited early")
+            else:
+                last_error = OSError("pointer suppressor hook operation failed")
+            if active:
+                break
+        cleanup_late_install = False
+        with self._lock:
+            if active and self._request_generation == request_generation:
+                self._request_generation += 1
+                self._requested_active = False
+                if self._hook is None:
+                    self._active = False
+                else:
+                    cleanup_late_install = True
+        if cleanup_late_install:
+            try:
+                self._request_hook_change(False)
+            except Exception:
+                # Failed unhook state must remain visible and retryable.
+                pass
+        raise last_error
+
+    def _run(self):
         HOOKPROC_M = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_int,
                                         w.WPARAM, ctypes.c_longlong)
 
@@ -634,21 +910,93 @@ class PointerSuppressor:
                               self.WM_MOUSEHWHEEL) \
                         and not (ms.flags & self.LLMHF_INJECTED) \
                         and ms.dwExtraInfo != MAGIC_EXTRA:
-                    return 1  # swallow
+                    return 1
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._proc = HOOKPROC_M(proc)
+        thread_id = kernel32.GetCurrentThreadId()
+        msg = w.MSG()
+        # PeekMessage creates this thread's message queue before callers post.
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        with self._lock:
+            self._thread_id = thread_id
+        self._ready.set()
 
-        def run():
-            hk = user32.SetWindowsHookExW(self.WH_MOUSE_LL, self._proc, None, 0)
-            if not hk:
-                return
-            msg = w.MSG()
+        try:
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
+                if msg.message == self.WM_INSTALL:
+                    request_generation = int(msg.wParam)
+                    with self._lock:
+                        owns_request = (
+                            self._requested_active
+                            and self._request_generation == request_generation
+                            and (
+                                self._request_deadline is None
+                                or time.monotonic() <= self._request_deadline
+                            )
+                        )
+                        should_install = (
+                            self._hook is None
+                            and owns_request
+                        )
+                        if self._hook is not None and owns_request:
+                            # A cancelled late install whose immediate unhook
+                            # failed can be safely reused by a newer activation.
+                            self._active = True
+                    installed = (
+                        self._install_hook(request_generation)
+                        if should_install else False
+                    )
+                    with self._lock:
+                        self._operation_error = None
+                        if (should_install and not installed
+                                and self._request_generation == request_generation):
+                            self._operation_error = OSError(
+                                ctypes.get_last_error(),
+                                "SetWindowsHookExW failed",
+                            )
+                        self._operation_generation = request_generation
+                    self._operation_done.set()
+                elif msg.message == self.WM_UNINSTALL:
+                    request_generation = int(msg.wParam)
+                    uninstalled = self._uninstall_hook()
+                    with self._lock:
+                        self._operation_error = None
+                        if not uninstalled:
+                            self._operation_error = OSError(
+                                ctypes.get_last_error(),
+                                "UnhookWindowsHookEx failed",
+                            )
+                        self._operation_generation = request_generation
+                    self._operation_done.set()
+                else:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self._uninstall_hook()
+            with self._lock:
+                self._requested_active = False
+                self._thread_id = 0
+                if self._hook is None:
+                    self._active = False
+            self._operation_done.set()
 
-        threading.Thread(target=run, daemon=True).start()
+    def shutdown(self):
+        try:
+            self.set(False)
+        except Exception:
+            # Preserve the hook state for the final thread-exit unhook attempt.
+            pass
+        with self._lock:
+            thread_id = self._thread_id
+            thread = self._thread
+        if thread_id:
+            user32.PostThreadMessageW(thread_id, self.WM_QUIT, 0, 0)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        with self._lock:
+            if thread is not None and not thread.is_alive() and self._thread is thread:
+                self._thread = None
 
 
 suppress_pointer = PointerSuppressor()
@@ -664,6 +1012,8 @@ class ThreeFingerDrag:
     """
 
     WM_INPUT = 0x00FF
+    WM_TIMER = 0x0113
+    TIMER_ID = 1
     RIDEV_INPUTSINK = 0x00000100
     RIM_TYPEHID = 2
     RID_INPUT = 0x10000003
@@ -718,6 +1068,12 @@ class ThreeFingerDrag:
             ctypes.POINTER(ctypes.c_uint), ctypes.c_uint]
         user32.GetRawInputDeviceInfoW.argtypes = [
             w.HANDLE, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        user32.RegisterRawInputDevices.argtypes = [
+            ctypes.POINTER(self.RAWINPUTDEVICE), ctypes.c_uint, ctypes.c_uint]
+        user32.RegisterRawInputDevices.restype = w.BOOL
+        user32.SetTimer.argtypes = [w.HWND, ctypes.c_size_t, w.UINT,
+                                    ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
 
         self._pp = {}            # hDevice -> preparsed buffer
         self._links = {}         # hDevice -> [contact link collections]
@@ -748,7 +1104,7 @@ class ThreeFingerDrag:
             buf = ctypes.create_unicode_buffer(size.value + 2)
             user32.GetRawInputDeviceInfoW(hdev, self.RIDI_DEVICENAME, buf,
                                           ctypes.byref(size))
-            ok = True  # any PTP touchpad; all report through usage 0x0D/0x05
+            ok = is_target_trackpad_path(buf.value)
             self._is_tp[hdev] = ok
         return ok
 
@@ -813,7 +1169,11 @@ class ThreeFingerDrag:
         inp = INPUT()
         inp.type = 0  # INPUT_MOUSE
         inp.u.mi = MOUSEINPUT(dx, dy, 0, flags, 0, MAGIC_EXTRA)
-        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        require_single_input(
+            lambda: user32.SendInput(
+                1, ctypes.byref(inp), ctypes.sizeof(INPUT)
+            )
+        )
 
     def _button(self, down):
         self._mouse(self.MOUSEEVENTF_LEFTDOWN if down else self.MOUSEEVENTF_LEFTUP)
@@ -834,13 +1194,10 @@ class ThreeFingerDrag:
         self._anchor = self._last = None
 
     def _frame(self, hdev, rep):
-        import time as _t
-        mode = config["three_finger_mode"]
-        now = _t.monotonic()
+        now = time.monotonic()
 
-        # 1. merge this report's contacts into the rolling touch table,
-        #    collecting per-contact motion deltas as we go
-        #    (always — scroll inversion needs the live contact count)
+        # Merge this report's contacts into the rolling touch table while
+        # collecting per-contact motion deltas.
         moved = []
         for cid, x, y, tip in self._contacts(hdev, rep):
             if x > 30000 or y > 30000:
@@ -854,14 +1211,14 @@ class ThreeFingerDrag:
                     self._touch[cid] = [x, y, now, x, y, now]
             else:
                 self._touch.pop(cid, None)   # explicit lift
-        # 2. expire contacts that silently stopped reporting
-        dead = [cid for cid, e in self._touch.items()
-                if now - e[2] > self.TOUCH_TTL]
-        for cid in dead:
-            del self._touch[cid]
+        self._process_state(now, moved)
 
+    def _process_state(self, now, moved):
+        """Expire silent contacts, update suppression, and advance gestures."""
+        expire_stale_contacts(self._touch, now, self.TOUCH_TTL)
         n = len(self._touch)
         suppress_pointer.set_contacts(n)
+        mode = config_value("three_finger_mode")
 
         if mode == "off":
             if self._state in ("dragging", "grace"):
@@ -870,8 +1227,12 @@ class ThreeFingerDrag:
             suppress_pointer.set(False)
             return
 
-        # freeze leaked pointer motion during 3-finger gestures
-        suppress_pointer.set(n >= 3)
+        # Freeze leaked pointer motion only after all three contacts pass the
+        # same freshness/maturity gates as gesture recognition. Contact-ID
+        # churn must never freeze ordinary one-finger movement.
+        suppress_pointer.set(should_suppress_pointer(
+            self._touch, now, self.FRESH, self.MIN_AGE
+        ))
 
         if mode == "drag":
             self._frame_drag(n, now, moved)
@@ -879,9 +1240,8 @@ class ThreeFingerDrag:
             self._frame_swipes(n, now)
 
     def _quality(self, entries, now):
-        """All 3 contacts fresh (still updating) and aged (not churn ghosts)."""
-        return (all(now - e[2] <= self.FRESH for e in entries)
-                and all(now - e[5] >= self.MIN_AGE for e in entries))
+        """All contacts fresh (still updating) and aged (not churn ghosts)."""
+        return contacts_are_stable(entries, now, self.FRESH, self.MIN_AGE)
 
     def _frame_drag(self, n, now, moved):
         if n == 3:
@@ -893,7 +1253,7 @@ class ThreeFingerDrag:
             elif self._state == "armed":
                 mdx = sum(e[0] - e[3] for e in entries) / 3.0
                 mdy = sum(e[1] - e[4] for e in entries) / 3.0
-                if (mdx * mdx + mdy * mdy) ** 0.5 >= config["drag_start_units"] \
+                if (mdx * mdx + mdy * mdy) ** 0.5 >= config_value("drag_start_units") \
                         and self._quality(entries, now):
                     self._button(True)
                     self._state = "dragging"
@@ -901,18 +1261,18 @@ class ThreeFingerDrag:
             elif self._state == "grace":
                 self._state = "dragging"     # fingers back — same drag
             elif self._state == "dragging" and moved:
-                gain = config["drag_gain"]
+                gain = config_value("drag_gain")
                 dx = sum(m[0] for m in moved)
                 dy = sum(m[1] for m in moved)
                 self._move(dx * gain, dy * gain)
         else:
             if self._state == "dragging":
                 self._state = "grace"
-                self._grace_deadline = now + config["drag_grace_ms"] / 1000.0
+                self._grace_deadline = now + config_value("drag_grace_ms") / 1000.0
             elif self._state == "grace":
                 if now > self._grace_deadline:
                     self._end_drag()
-            elif self._state == "armed":
+            elif self._state == "armed" and n == 0:
                 self._state = "idle"
 
     def _frame_swipes(self, n, now):
@@ -929,7 +1289,7 @@ class ThreeFingerDrag:
                 dys = [e[1] - e[4] for e in entries]
                 mdx = sum(dxs) / 3.0
                 mdy = sum(dys) / 3.0
-                units = config["swipe_units"]
+                units = config_value("swipe_units")
                 if abs(mdx) >= abs(mdy):
                     mag, other, ds = abs(mdx), abs(mdy), dxs
                     units *= 1.5           # horizontal swipes must be deliberate
@@ -945,48 +1305,96 @@ class ThreeFingerDrag:
                         direction = "down" if mdy > 0 else "up"  # PTP Y grows down
                     actions.put(SWIPE_ACTIONS[direction])
                     self._state = "fired"    # one gesture per touchdown
-            # state "fired": ignore all further motion until fingers lift
-        else:
+            # state "fired": ignore all further motion until every contact
+            # has genuinely expired/lifted; transient churn counts must not
+            # re-arm the same physical touchdown.
+        elif n == 0:
             if self._state in ("armed", "fired"):
                 self._state = "idle"
                 self._anchor = self._last = None
 
-    def _tick_grace(self):
-        """Called from message loop timer — releases the button if the grace
-        window expires with no frames arriving (fingers fully lifted)."""
-        import time as _t
-        if self._state == "grace" and _t.monotonic() > self._grace_deadline:
+    def _maintenance(self):
+        """Timer-driven expiry also runs when the device sends no lift frame."""
+        self._process_state(time.monotonic(), [])
+
+    def release_pending_button(self):
+        """Retry only a pending synthetic LEFTUP, without hook cleanup."""
+        if self._state in ("dragging", "grace"):
             self._end_drag()
 
+    def abort_gesture(self):
+        """Fail open on malformed input: never leave pointer/button blocked."""
+        self._touch.clear()
+        errors = release_custom_input(
+            self.release_pending_button,
+            lambda: suppress_pointer.set(False),
+        )
+        if self._state in ("dragging", "grace"):
+            # A failed LEFTUP remains visible so the next cleanup retries it.
+            pass
+        else:
+            self._state = "idle"
+        if errors:
+            raise errors[0]
+
     # ---------------- raw input plumbing ----------------
+    def _handle_raw_input(self, lparam):
+        """Validate and dispatch one WM_INPUT payload or raise fail-open."""
+        header_size = ctypes.sizeof(self.RAWINPUTHEADER)
+        size = ctypes.c_uint(0)
+        user32.GetRawInputData(
+            ctypes.c_void_p(lparam), self.RID_INPUT, None,
+            ctypes.byref(size), header_size,
+        )
+        if size.value < header_size + 8:
+            raise ValueError("raw input payload is too short")
+
+        buf = ctypes.create_string_buffer(size.value)
+        copied = user32.GetRawInputData(
+            ctypes.c_void_p(lparam), self.RID_INPUT, buf,
+            ctypes.byref(size), header_size,
+        )
+        if copied == 0xFFFFFFFF or copied != size.value:
+            raise OSError("GetRawInputData failed or returned a partial payload")
+
+        hdr = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTHEADER)).contents
+        if hdr.dwType != self.RIM_TYPEHID or not self._device_ok(hdr.hDevice):
+            return
+
+        two = ctypes.cast(
+            ctypes.byref(buf, header_size), ctypes.POINTER(w.DWORD * 2)
+        ).contents
+        report_size, report_count = two[0], two[1]
+        data_offset = header_size + 8
+        data_end = data_offset + report_size * report_count
+        if not report_size or data_end > len(buf):
+            raise ValueError("raw HID report array exceeds its payload")
+
+        for index in range(report_count):
+            start = data_offset + index * report_size
+            report = buf.raw[start:start + report_size]
+            self._frame(hdr.hDevice, report)
+
     def _run(self):
         WNDPROCTYPE = ctypes.WINFUNCTYPE(ctypes.c_longlong, w.HWND, ctypes.c_uint,
                                          w.WPARAM, w.LPARAM)
 
         def wndproc(hwnd, msg, wp, lp):
+            if msg == self.WM_TIMER and wp == self.TIMER_ID:
+                run_input_callback(
+                    self._maintenance,
+                    self.abort_gesture,
+                    append_error,
+                    "Raw Input maintenance callback",
+                )
+                return 0
             if msg == self.WM_INPUT:
-                size = ctypes.c_uint(0)
-                user32.GetRawInputData(ctypes.c_void_p(lp), self.RID_INPUT, None,
-                                       ctypes.byref(size),
-                                       ctypes.sizeof(self.RAWINPUTHEADER))
-                buf = ctypes.create_string_buffer(size.value)
-                user32.GetRawInputData(ctypes.c_void_p(lp), self.RID_INPUT, buf,
-                                       ctypes.byref(size),
-                                       ctypes.sizeof(self.RAWINPUTHEADER))
-                hdr = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTHEADER)).contents
-                if hdr.dwType == self.RIM_TYPEHID and self._device_ok(hdr.hDevice):
-                    off = ctypes.sizeof(self.RAWINPUTHEADER)
-                    two = ctypes.cast(ctypes.byref(buf, off),
-                                      ctypes.POINTER(w.DWORD * 2)).contents
-                    sz, cnt = two[0], two[1]
-                    data_off = off + 8
-                    for i in range(cnt):
-                        rep = buf.raw[data_off + i * sz: data_off + (i + 1) * sz]
-                        try:
-                            self._frame(hdr.hDevice, rep)
-                        except Exception:
-                            if self._state in ("dragging", "grace"):
-                                self._end_drag()
+                run_input_callback(
+                    lambda: self._handle_raw_input(lp),
+                    self.abort_gesture,
+                    append_error,
+                    "Raw Input callback",
+                )
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
@@ -1014,14 +1422,12 @@ class ThreeFingerDrag:
         if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1,
                                               ctypes.sizeof(self.RAWINPUTDEVICE)):
             return  # no PTP device / registration failed — feature disabled
+        if not user32.SetTimer(hwnd, self.TIMER_ID, 10, None):
+            return
         msg = w.MSG()
-        import time as _t
-        while True:
-            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-            self._tick_grace()
-            _t.sleep(0.004)
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1032,79 +1438,67 @@ three_finger_drag = ThreeFingerDrag()
 
 # ---------------------------------------------------------------- touchpad settings
 class TouchpadSettings:
-    """Windows Precision Touchpad registry settings needed by Tragic Trackpad.
-
-    Backs up original values into the config JSON on first apply, so
-    everything is reversible. Values take effect on next device
-    reconnect/logon for some builds; most apply live.
-    """
+    """Windows registry adapter around the reversible settings manager."""
 
     KEY = r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad"
-    # Mac-like navigation: native Windows 3-finger swipes ON
-    # (up=Task View, down=show desktop, left/right=switch apps)
-    REQUIRED = {"ThreeFingerSlideEnabled": 1, "ThreeFingerTapEnabled": 1}
-    # mac-feel niceties (not strictly required)
-    RECOMMENDED = {"TapsEnabled": 1, "TwoFingerTapEnabled": 1, "TapAndDrag": 1}
-    # needed ONLY while our three-finger drag daemon is enabled (it must own
-    # the 3-finger gesture, so native swipes get turned off)
-    DRAG_MODE = {"ThreeFingerSlideEnabled": 0, "ThreeFingerTapEnabled": 0}
+    REQUIRED = TouchpadSettingsManager.NATIVE_GESTURES
+    DRAG_MODE = TouchpadSettingsManager.CUSTOM_GESTURES
+    RECOMMENDED = TouchpadSettingsManager.RECOMMENDED
+
+    def __init__(self):
+        self._manager = TouchpadSettingsManager(
+            config=config,
+            read_value=self._read,
+            write_value=self._write,
+            delete_value=self._delete,
+            save=lambda: save_config(config),
+        )
 
     def _read(self, name):
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY) as k:
-                return winreg.QueryValueEx(k, name)[0]
-        except OSError:
-            return None
+        def query():
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY) as key:
+                return winreg.QueryValueEx(key, name)[0]
+
+        return read_optional_value(query)
 
     def _write(self, name, value):
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.KEY) as k:
-            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, int(value))
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.KEY) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+
+    def _delete(self, name):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass
 
     def status(self):
-        """True if all REQUIRED settings already correct."""
-        return all(self._read(n) == v for n, v in self.REQUIRED.items())
+        return self.status_text() == "applied"
+
+    def status_text(self):
+        return self._manager.status_text(config_value("three_finger_mode"))
 
     def apply(self, include_recommended=True):
-        backup = config.get("tp_settings_backup") or {}
-        wanted = dict(self.REQUIRED)
-        if include_recommended:
-            wanted.update(self.RECOMMENDED)
-        for name, value in wanted.items():
-            cur = self._read(name)
-            if cur != value:
-                if name not in backup:
-                    backup[name] = cur          # None = value didn't exist
-                self._write(name, value)
-        config["tp_settings_backup"] = backup
-        save_config(config)
+        return self._manager.apply(
+            config_value("three_finger_mode"), include_recommended
+        )
+
+    def enforce(self):
+        return self._manager.enforce(config_value("three_finger_mode"))
 
     def restore(self):
-        backup = config.get("tp_settings_backup") or {}
-        for name, old in backup.items():
-            try:
-                if old is None:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY, 0,
-                                        winreg.KEY_SET_VALUE) as k:
-                        winreg.DeleteValue(k, name)
-                else:
-                    self._write(name, old)
-            except OSError:
-                pass
-        config["tp_settings_backup"] = {}
-        save_config(config)
+        return self._manager.restore()
 
-    # natural scrolling: ScrollDirection 0 = mac-style (content follows
-    # fingers), 1 = classic wheel (swipe down -> page scrolls down).
-    # The gesture engine re-reads this when the device (re)initializes:
-    # trackpad power switch off/on, or reboot. NEVER restart the device
-    # from this process — doing so with our Raw Input handles open wedges
-    # the process in an unkillable kernel wait (learned the hard way).
+    # ScrollDirection: 0 = content follows fingers (natural), 1 = classic
+    # wheel direction. Windows reads it when the trackpad initializes.
     def natural_scroll_get(self):
         return self._read("ScrollDirection") == 0
 
     def natural_scroll_set(self, natural):
-        self._write("ScrollDirection", 0 if natural else 1)
-        # nudge listeners; harmless if nothing picks it up
+        with CONFIG_LOCK:
+            config["natural_scroll"] = bool(natural)
+            changed = self._manager.apply(config_value("three_finger_mode"))
         try:
             HWND_BROADCAST, WM_SETTINGCHANGE = 0xFFFF, 0x001A
             user32.SendMessageTimeoutW(
@@ -1113,6 +1507,7 @@ class TouchpadSettings:
                 0x0002, 1000, ctypes.byref(ctypes.c_ulong()))
         except Exception:
             pass
+        return changed
 
 
 tp_settings = TouchpadSettings()
@@ -1160,8 +1555,9 @@ def make_icon():
 
 
 def on_toggle(icon, item):
-    config["mac_fkeys"] = not config["mac_fkeys"]
-    save_config(config)
+    with CONFIG_LOCK:
+        config["mac_fkeys"] = not config_value("mac_fkeys")
+        save_config(config)
 
 
 def on_autostart(icon, item):
@@ -1169,49 +1565,109 @@ def on_autostart(icon, item):
 
 
 def set_tf_mode(mode):
-    config["three_finger_mode"] = mode
-    save_config(config)
-    # While Tragic Trackpad owns the 3-finger gesture (swipes or drag), native
-    # Windows swipes must be off — on healthy PTP drivers both would fire.
-    # mode 'off' hands the gesture back to Windows.
+    # Custom modes must own the gesture exclusively. Off mode restores native
+    # handling only while the user has explicitly applied managed settings;
+    # after Restore, off mode leaves the original registry values untouched.
     try:
-        if mode == "off":
-            for k_, v_ in tp_settings.REQUIRED.items():
-                tp_settings._write(k_, v_)
-        else:
-            for k_, v_ in tp_settings.DRAG_MODE.items():
-                tp_settings._write(k_, v_)
+        return set_managed_mode(
+            config,
+            mode,
+            enforce=lambda requested_mode: tp_settings.enforce(),
+            save=lambda: save_config(config),
+        )
+    except Exception:
+        # A failed switch has already rolled mode off. Release any gesture that
+        # belonged to the previous mode without coupling it to hook cleanup.
+        release_custom_input(
+            three_finger_drag.abort_gesture,
+            lambda: suppress_pointer.set(False),
+        )
+        raise
+
+
+def _update_menu(icon):
+    try:
+        icon.update_menu()
+    except Exception:
+        pass
+
+
+def _notify(icon, message, title):
+    try:
+        icon.notify(message, title)
     except Exception:
         pass
 
 
 def on_mode_swipes(icon, item):
     set_tf_mode("swipes")
+    _update_menu(icon)
 
 
 def on_mode_drag(icon, item):
     set_tf_mode("drag")
+    _update_menu(icon)
 
 
 def on_mode_off(icon, item):
     set_tf_mode("off")
+    release_custom_input(
+        three_finger_drag.abort_gesture,
+        lambda: suppress_pointer.set(False),
+    )
+    _update_menu(icon)
 
 
 def on_natural_scroll(icon, item):
-    tp_settings.natural_scroll_set(not tp_settings.natural_scroll_get())
     try:
-        icon.notify("Flip the trackpad's power switch off/on (2 s) to apply "
-                    "— or it applies at next reboot.", "Scroll direction saved")
-    except Exception:
-        pass
+        changed = tp_settings.natural_scroll_set(
+            not tp_settings.natural_scroll_get()
+        )
+    except Exception as exc:
+        _notify(icon, f"Could not save scroll direction: {exc}",
+                "Scroll direction failed")
+    else:
+        _notify(icon,
+                "Flip the trackpad's power switch off/on (2 s) to apply — "
+                "or it applies at next reboot. "
+                f"Updated {len(changed)} setting(s).",
+                "Scroll direction saved")
+    _update_menu(icon)
 
 
 def on_apply_tp(icon, item):
-    tp_settings.apply()
+    try:
+        changed = tp_settings.apply()
+    except Exception as exc:
+        _notify(icon, f"Could not apply settings: {exc}",
+                "Touchpad settings failed")
+    else:
+        detail = (f"Updated {len(changed)} setting(s)."
+                  if changed else "Settings were already correct.")
+        _notify(icon,
+                detail + " Reconnect the trackpad if Windows does not update immediately.",
+                "Touchpad settings applied")
+    _update_menu(icon)
 
 
 def on_restore_tp(icon, item):
-    tp_settings.restore()
+    # Stop interception and release synthetic input before touching the
+    # registry; even a partial restore must fail open.
+    release_custom_input(
+        three_finger_drag.abort_gesture,
+        lambda: suppress_pointer.set(False),
+    )
+    try:
+        restored = tp_settings.restore()
+    except Exception as exc:
+        _notify(icon, f"Could not restore settings: {exc}",
+                "Touchpad restore failed")
+    else:
+        detail = (f"Restored {len(restored)} original setting(s)."
+                  if restored else "No saved changes remained to restore.")
+        _notify(icon, detail + " Custom 3-finger handling is now off.",
+                "Original touchpad settings restored")
+    _update_menu(icon)
 
 
 def first_run_setup():
@@ -1223,7 +1679,9 @@ def first_run_setup():
     Returns True when this really was the first run, so the caller can
     announce it instead of leaving the user to guess.
     """
-    if config.get("setup_done"):
+    if CONFIG_RECOVERY_ERROR is not None:
+        return False
+    if config_value("setup_done"):
         return False
     try:
         autostart_set(True)
@@ -1232,9 +1690,12 @@ def first_run_setup():
     try:
         tp_settings.apply()
     except Exception:
-        pass
-    config["setup_done"] = True
-    save_config(config)
+        # Keep onboarding pending and suppress the success toast. Apply already
+        # fails custom gesture ownership closed when registry mutation fails.
+        return False
+    with CONFIG_LOCK:
+        config["setup_done"] = True
+        save_config(config)
     return True
 
 
@@ -1250,6 +1711,15 @@ def tray_setup(icon, first_run):
     here should steal focus.
     """
     icon.visible = True
+    if CONFIG_RECOVERY_ERROR is not None:
+        _notify(
+            icon,
+            "pearipherals.json is malformed or unreadable. The original was "
+            "preserved and automatic settings changes are disabled. Move or "
+            "repair that file, then restart Pearipherals.",
+            "Config recovery required",
+        )
+        return
     if not first_run:
         return
     import time as _t
@@ -1264,6 +1734,24 @@ def tray_setup(icon, first_run):
 
 def on_quit(icon, item):
     actions.put(None)
+    shutdown_errors = shutdown_custom_input(
+        three_finger_drag.abort_gesture,
+        lambda: suppress_pointer.set(False),
+        suppress_pointer.shutdown,
+        retry_release=three_finger_drag.release_pending_button,
+    )
+    if shutdown_errors:
+        detail = "; ".join(str(error) for error in shutdown_errors)
+        _notify(icon, detail, "Input release failed on Quit")
+        try:
+            log_path = os.path.join(APP_DIR, "pearipherals.err.log")
+            with open(log_path, "a", encoding="utf-8") as stream:
+                stream.write(
+                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"Input release failed on Quit: {detail}\n"
+                )
+        except Exception:
+            pass
     try:
         if brightness.last_backend == "software dim":
             brightness.gamma.restore()
@@ -1275,30 +1763,29 @@ def on_quit(icon, item):
 
 def main():
     global tray_icon
-    # migrate: drop autostart entries from the pre-rename names
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                            winreg.KEY_SET_VALUE) as k:
-            for old in OLD_RUN_NAMES:
-                try:
-                    winreg.DeleteValue(k, old)
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    # Migrate old autostart names only when the primary config is trustworthy.
+    if CONFIG_RECOVERY_ERROR is None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                for old in OLD_RUN_NAMES:
+                    try:
+                        winreg.DeleteValue(k, old)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     is_first_run = first_run_setup()
-    # enforce gesture-ownership invariant every launch:
-    # swipes/drag mode -> native 3-finger swipes off; off -> native on
-    try:
-        wanted = (tp_settings.REQUIRED if config["three_finger_mode"] == "off"
-                  else tp_settings.DRAG_MODE)
-        for k_, v_ in wanted.items():
-            if tp_settings._read(k_) != v_:
-                tp_settings._write(k_, v_)
-    except Exception:
-        pass
+    # Re-assert only settings the user still asked Pearipherals to manage.
+    # A recovery-required primary config disables all automatic registry writes.
+    if CONFIG_RECOVERY_ERROR is None:
+        try:
+            set_tf_mode(config_value("three_finger_mode"))
+        except Exception:
+            # set_tf_mode has already durably failed closed to off.
+            pass
     # portable self-heal: if autostart is on but we've been moved, re-point it
-    if autostart_get():
+    if CONFIG_RECOVERY_ERROR is None and autostart_get():
         try:
             autostart_set(True)
         except Exception:
@@ -1313,27 +1800,27 @@ def main():
         menu=pystray.Menu(
             pystray.MenuItem("Tragic Keyboard (F1-F12 → media/brightness)",
                              on_toggle,
-                             checked=lambda i: config["mac_fkeys"]),
+                             checked=lambda i: config_value("mac_fkeys")),
             pystray.MenuItem("Tragic Trackpad — 3-finger gesture", pystray.Menu(
-                pystray.MenuItem("Swipes (Task View / desktop / switch apps)",
+                pystray.MenuItem("Swipes (Task View / minimize / restore)",
                                  on_mode_swipes, radio=True,
-                                 checked=lambda i: config["three_finger_mode"] == "swipes"),
+                                 checked=lambda i: config_value("three_finger_mode") == "swipes"),
                 pystray.MenuItem("Drag (move windows / select like a Mac)",
                                  on_mode_drag, radio=True,
-                                 checked=lambda i: config["three_finger_mode"] == "drag"),
+                                 checked=lambda i: config_value("three_finger_mode") == "drag"),
                 pystray.MenuItem("Off (let Windows handle it)",
                                  on_mode_off, radio=True,
-                                 checked=lambda i: config["three_finger_mode"] == "off"),
+                                 checked=lambda i: config_value("three_finger_mode") == "off"),
             )),
             pystray.MenuItem("Natural scrolling", on_natural_scroll,
                              checked=lambda i: tp_settings.natural_scroll_get()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Touchpad settings", pystray.Menu(
-                pystray.MenuItem("Status: OK" if tp_settings.status()
-                                 else "Status: needs apply",
-                                 None, enabled=False),
-                pystray.MenuItem("Apply Mac-style settings", on_apply_tp),
-                pystray.MenuItem("Restore Windows defaults", on_restore_tp),
+                pystray.MenuItem(
+                    lambda item: f"Status: {tp_settings.status_text()}",
+                    None, enabled=False),
+                pystray.MenuItem("Apply recommended settings", on_apply_tp),
+                pystray.MenuItem("Restore original Windows settings", on_restore_tp),
             )),
             pystray.MenuItem("Start with Windows", on_autostart,
                              checked=lambda i: autostart_get()),
