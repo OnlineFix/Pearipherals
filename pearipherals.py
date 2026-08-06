@@ -59,6 +59,7 @@ from pearipherals_core import (
     run_input_callback,
     save_json_atomic,
     set_managed_mode,
+    should_suppress_mouse_event,
     should_suppress_pointer,
     shutdown_custom_input,
 )
@@ -914,10 +915,10 @@ class PointerSuppressor:
             if nCode == 0 and self._active:
                 ms = ctypes.cast(ctypes.c_void_p(lParam),
                                  ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
-                if wParam in (self.WM_MOUSEMOVE, self.WM_MOUSEWHEEL,
-                              self.WM_MOUSEHWHEEL) \
-                        and not (ms.flags & self.LLMHF_INJECTED) \
-                        and ms.dwExtraInfo != MAGIC_EXTRA:
+                if should_suppress_mouse_event(
+                    wParam, ms.flags, ms.dwExtraInfo, self._active,
+                    self.LLMHF_INJECTED, MAGIC_EXTRA,
+                ):
                     return 1
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
@@ -1020,9 +1021,12 @@ class ThreeFingerDrag:
     """
 
     WM_INPUT = 0x00FF
+    WM_INPUT_DEVICE_CHANGE = 0x00FE
     WM_TIMER = 0x0113
     TIMER_ID = 1
     RIDEV_INPUTSINK = 0x00000100
+    RIDEV_DEVNOTIFY = 0x00002000
+    GIDC_REMOVAL = 2
     RIM_TYPEHID = 2
     RID_INPUT = 0x10000003
     RIDI_PREPARSEDDATA = 0x20000005
@@ -1089,16 +1093,20 @@ class ThreeFingerDrag:
         # Hybrid-report assembly: the AmtPtp driver sends ONE contact per HID
         # report; a "frame" only exists as a rolling window. Track contacts by
         # ID and expire the ones that stop reporting.
-        self._touch = {}         # cid -> [x, y, last_ts, x0, y0, t0]
+        self._touch = {}         # (hDevice, cid) -> [x, y, last_ts, x0, y0, t0]
         self.TOUCH_TTL = 0.07    # s without an update -> contact considered gone
         self.FRESH = 0.06        # every contact must be this fresh to fire
         self.MIN_AGE = 0.06      # and this old — filters ghost IDs from churn
+        self.MAX_CONTACT_JUMP = 1500
+        self.ALL_UP_DEBOUNCE = 0.05
         # drag state machine: idle -> armed -> dragging (-> grace -> dragging)
         self._state = "idle"
         self._anchor = None      # (x, y) three-finger centroid at arm time
         self._last = None        # last centroid
         self._grace_deadline = 0.0
         self._residual = [0.0, 0.0]
+        self._swipe_fired = False
+        self._all_up_since = None
         self._wndproc_ref = None
         self._thread = None
 
@@ -1168,8 +1176,10 @@ class ThreeFingerDrag:
                                        pp, rep, len(rep)) == self.HIDP_SUCCESS:
                 got = {ub[i] for i in range(n.value)}
                 tip, conf = self.U_TIP in got, self.U_CONF in got
-            if conf or tip:
-                out.append((cid, x, y, tip))
+            # Emit every readable slot, including Tip=0/Confidence=0. The
+            # all-clear report is an explicit lift for a known CID; dropping it
+            # would leave suppression active until TTL expiry.
+            out.append((cid, x, y, tip and conf))
         return out
 
     # ---------------- mouse synthesis ----------------
@@ -1210,15 +1220,26 @@ class ThreeFingerDrag:
         for cid, x, y, tip in self._contacts(hdev, rep):
             if x > 30000 or y > 30000:
                 continue          # garbage/padding contact (e.g. id 65535)
+            key = (hdev, cid)
             if tip:
-                e = self._touch.get(cid)
+                e = self._touch.get(key)
                 if e is not None:
-                    moved.append((x - e[0], y - e[1]))
-                    e[0], e[1], e[2] = x, y, now
+                    dx, dy = x - e[0], y - e[1]
+                    reused = (
+                        now - e[2] > self.FRESH
+                        or dx * dx + dy * dy > self.MAX_CONTACT_JUMP ** 2
+                    )
+                    if reused:
+                        # The driver can recycle a CID without an intervening
+                        # lift. Re-anchor it without producing cursor motion.
+                        self._touch[key] = [x, y, now, x, y, now]
+                    else:
+                        moved.append((dx, dy))
+                        e[0], e[1], e[2] = x, y, now
                 else:
-                    self._touch[cid] = [x, y, now, x, y, now]
+                    self._touch[key] = [x, y, now, x, y, now]
             else:
-                self._touch.pop(cid, None)   # explicit lift
+                self._touch.pop(key, None)   # explicit lift
         self._process_state(now, moved)
 
     def _process_state(self, now, moved):
@@ -1232,6 +1253,9 @@ class ThreeFingerDrag:
             if self._state in ("dragging", "grace"):
                 self._end_drag()
             self._state = "idle"
+            self._touch.clear()
+            self._swipe_fired = False
+            self._all_up_since = None
             suppress_pointer.set(False)
             return
 
@@ -1284,8 +1308,21 @@ class ThreeFingerDrag:
                 self._state = "idle"
 
     def _frame_swipes(self, n, now):
-        """One swipe per 3-finger touchdown. Per-contact displacement, all
-        fingers must agree on direction — immune to ID churn and ghosts."""
+        """One swipe per debounced all-up-delimited touchdown epoch."""
+        if n == 0:
+            if self._all_up_since is None:
+                self._all_up_since = now
+            elif now - self._all_up_since >= self.ALL_UP_DEBOUNCE:
+                self._swipe_fired = False
+                if self._state in ("armed", "fired"):
+                    self._state = "idle"
+                    self._anchor = self._last = None
+            return
+
+        self._all_up_since = None
+        if self._swipe_fired:
+            return
+
         if n == 3:
             entries = list(self._touch.values())
             if self._state == "idle":
@@ -1312,14 +1349,9 @@ class ThreeFingerDrag:
                     else:
                         direction = "down" if mdy > 0 else "up"  # PTP Y grows down
                     actions.put(SWIPE_ACTIONS[direction])
-                    self._state = "fired"    # one gesture per touchdown
-            # state "fired": ignore all further motion until every contact
-            # has genuinely expired/lifted; transient churn counts must not
-            # re-arm the same physical touchdown.
-        elif n == 0:
-            if self._state in ("armed", "fired"):
-                self._state = "idle"
-                self._anchor = self._last = None
+                    self._state = "fired"
+                    self._swipe_fired = True
+            # n=2/n=4 and state fired are ignored. Neither can start a new epoch.
 
     def _maintenance(self):
         """Timer-driven expiry also runs when the device sends no lift frame."""
@@ -1333,6 +1365,8 @@ class ThreeFingerDrag:
     def abort_gesture(self):
         """Fail open on malformed input: never leave pointer/button blocked."""
         self._touch.clear()
+        self._swipe_fired = False
+        self._all_up_since = None
         errors = release_custom_input(
             self.release_pending_button,
             lambda: suppress_pointer.set(False),
@@ -1344,6 +1378,17 @@ class ThreeFingerDrag:
             self._state = "idle"
         if errors:
             raise errors[0]
+
+    def device_disconnected(self, hdev):
+        """Fail open immediately when Raw Input reports device removal."""
+        known = hdev in self._pp or hdev in self._is_tp or any(
+            key[0] == hdev for key in self._touch
+        )
+        self._pp.pop(hdev, None)
+        self._links.pop(hdev, None)
+        self._is_tp.pop(hdev, None)
+        if known:
+            self.abort_gesture()
 
     # ---------------- raw input plumbing ----------------
     def _handle_raw_input(self, lparam):
@@ -1388,6 +1433,14 @@ class ThreeFingerDrag:
                                          w.WPARAM, w.LPARAM)
 
         def wndproc(hwnd, msg, wp, lp):
+            if msg == self.WM_INPUT_DEVICE_CHANGE and wp == self.GIDC_REMOVAL:
+                run_input_callback(
+                    lambda: self.device_disconnected(lp),
+                    self.abort_gesture,
+                    append_error,
+                    "Raw Input device disconnect callback",
+                )
+                return 0
             if msg == self.WM_TIMER and wp == self.TIMER_ID:
                 run_input_callback(
                     self._maintenance,
@@ -1425,8 +1478,10 @@ class ThreeFingerDrag:
         user32.RegisterClassW(ctypes.byref(wc))
         hwnd = user32.CreateWindowExW(0, wc.lpszClassName, "tfd", 0, 0, 0, 0, 0,
                                       None, None, hinst, None)
-        rid = self.RAWINPUTDEVICE(self.UP_DIG, self.U_TOUCHPAD,
-                                  self.RIDEV_INPUTSINK, hwnd)
+        rid = self.RAWINPUTDEVICE(
+            self.UP_DIG, self.U_TOUCHPAD,
+            self.RIDEV_INPUTSINK | self.RIDEV_DEVNOTIFY, hwnd,
+        )
         if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1,
                                               ctypes.sizeof(self.RAWINPUTDEVICE)):
             return  # no PTP device / registration failed — feature disabled

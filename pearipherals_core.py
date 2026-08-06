@@ -388,6 +388,19 @@ def should_suppress_pointer(contacts, now, fresh, min_age):
     )
 
 
+def should_suppress_mouse_event(
+    message, flags, extra_info, active, injected_flag=0x01, app_tag=0x50454152
+):
+    """Return whether an untrusted physical pointer event should be swallowed."""
+    pointer_messages = {0x0200, 0x020A, 0x020E}
+    return (
+        bool(active)
+        and message in pointer_messages
+        and not (flags & injected_flag)
+        and extra_info != app_tag
+    )
+
+
 def expire_stale_contacts(contacts, now, ttl):
     """Drop silent contacts so suppression cannot stick after finger lift."""
     expired = sorted(
@@ -529,7 +542,14 @@ class TouchpadSettingsManager:
                 remaining.pop(name, None)
 
         self.config["tp_settings_backup"] = remaining
-        self._save()
+        try:
+            self._save()
+        except Exception:
+            # The durable sidecar still contains the full recovery set. Keep
+            # the in-memory view equally conservative so a later retry cannot
+            # forget originals merely because pruning failed to persist.
+            self.config["tp_settings_backup"] = backup
+            raise
         if failures:
             names = ", ".join(name for name, _ in failures)
             first_error = failures[0][1]
@@ -545,7 +565,11 @@ class TouchpadSettingsManager:
 
     def status_text(self, mode):
         with self._lock:
-            if mode == "off" and self.config.get("tp_settings_backup"):
+            if (
+                mode == "off"
+                and not self.config.get("tp_settings_applied", False)
+                and self.config.get("tp_settings_backup")
+            ):
                 return "restore incomplete"
             if mode == "off" and not self.config.get("tp_settings_applied", False):
                 return "original settings"

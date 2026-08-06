@@ -30,6 +30,7 @@ from pearipherals_core import (
     run_input_callback,
     save_json_atomic,
     set_managed_mode,
+    should_suppress_mouse_event,
     should_suppress_pointer,
     shutdown_custom_input,
 )
@@ -1021,6 +1022,196 @@ class TouchpadSettingsManagerTests(unittest.TestCase):
         self.assertEqual([], writes)
         self.assertEqual("original settings", manager.status_text("off"))
 
+    def test_wanted_apply_status_and_startup_enforcement_share_every_mode_plan(self):
+        for mode in ("swipes", "drag", "off"):
+            with self.subTest(mode=mode):
+                values = {
+                    "ThreeFingerSlideEnabled": 9,
+                    "ThreeFingerTapEnabled": 9,
+                    "TapsEnabled": 0,
+                    "TwoFingerTapEnabled": 0,
+                    "TapAndDrag": 0,
+                    "ScrollDirection": 0,
+                }
+                config = {
+                    "three_finger_mode": mode,
+                    "natural_scroll": False,
+                    "tp_settings_applied": True,
+                }
+                manager = TouchpadSettingsManager(
+                    config,
+                    read_value=lambda name: values.get(name),
+                    write_value=lambda name, value: values.__setitem__(name, value),
+                    delete_value=lambda name: values.pop(name, None),
+                    save=lambda: None,
+                )
+                wanted = manager.wanted(mode)
+
+                manager.apply(mode)
+                self.assertEqual(wanted, {name: values[name] for name in wanted})
+                self.assertEqual("applied", manager.status_text(mode))
+                self.assertEqual([], manager.enforce(mode))
+                self.assertEqual(1, values["ScrollDirection"])
+                expected_native = 1 if mode == "off" else 0
+                self.assertEqual(expected_native, values["ThreeFingerSlideEnabled"])
+                self.assertEqual(expected_native, values["ThreeFingerTapEnabled"])
+
+    def test_every_apply_registry_write_failure_retains_complete_original_plan(self):
+        wanted = {
+            **TouchpadSettingsManager.CUSTOM_GESTURES,
+            **TouchpadSettingsManager.RECOMMENDED,
+            "ScrollDirection": 1,
+        }
+        names = list(wanted)
+        for failed_index in range(len(names)):
+            with self.subTest(failed_index=failed_index):
+                original = {name: 1 - value for name, value in wanted.items()}
+                values = dict(original)
+                config = {"three_finger_mode": "swipes", "natural_scroll": False}
+                writes = 0
+
+                def write(name, value):
+                    nonlocal writes
+                    if writes == failed_index:
+                        raise OSError(f"write {failed_index} failed")
+                    writes += 1
+                    values[name] = value
+
+                manager = TouchpadSettingsManager(
+                    config,
+                    read_value=lambda name: values.get(name),
+                    write_value=write,
+                    delete_value=lambda name: values.pop(name, None),
+                    save=lambda: None,
+                )
+                with self.assertRaises(OSError):
+                    manager.apply("swipes")
+                self.assertEqual(original, config["tp_settings_backup"])
+                self.assertFalse(config["tp_settings_applied"])
+                self.assertEqual("off", config["three_finger_mode"])
+
+    def test_apply_final_persistence_failure_keeps_complete_backup_failed_closed(self):
+        values = {"ThreeFingerSlideEnabled": 1, "ThreeFingerTapEnabled": 1}
+        original = dict(values)
+        config = {"three_finger_mode": "swipes"}
+        saves = 0
+
+        def save():
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                raise OSError("success marker save failed")
+
+        manager = TouchpadSettingsManager(
+            config,
+            lambda name: values.get(name),
+            lambda name, value: values.__setitem__(name, value),
+            lambda name: values.pop(name, None),
+            save,
+        )
+        with self.assertRaises(OSError):
+            manager.apply("swipes", include_recommended=False)
+        self.assertEqual(original, config["tp_settings_backup"])
+        self.assertEqual("off", config["three_finger_mode"])
+        self.assertFalse(config["tp_settings_applied"])
+
+    def test_restore_initial_persistence_failure_performs_no_registry_operation(self):
+        config = {
+            "three_finger_mode": "swipes",
+            "tp_settings_applied": True,
+            "tp_settings_backup": {"A": 10, "B": None},
+        }
+        events = []
+        manager = TouchpadSettingsManager(
+            config,
+            lambda name: 1,
+            lambda name, value: events.append(("write", name, value)),
+            lambda name: events.append(("delete", name)),
+            lambda: (_ for _ in ()).throw(OSError("pre-restore save failed")),
+        )
+        with self.assertRaises(OSError):
+            manager.restore()
+        self.assertEqual([], events)
+        self.assertEqual({"A": 10, "B": None}, config["tp_settings_backup"])
+        self.assertEqual("off", config["three_finger_mode"])
+        self.assertFalse(config["tp_settings_applied"])
+
+    def test_every_restore_failure_retains_exact_failed_entries_for_retry(self):
+        backup = {"A": 10, "B": None, "C": 30}
+        for failed_name in backup:
+            with self.subTest(failed_name=failed_name):
+                values = {"A": 1, "B": 2, "C": 3}
+                config = {
+                    "three_finger_mode": "swipes",
+                    "tp_settings_applied": True,
+                    "tp_settings_backup": dict(backup),
+                }
+
+                def write(name, value):
+                    if name == failed_name:
+                        raise OSError("restore write failed")
+                    values[name] = value
+
+                def delete(name):
+                    if name == failed_name:
+                        raise OSError("restore delete failed")
+                    values.pop(name, None)
+
+                manager = TouchpadSettingsManager(
+                    config, lambda name: values.get(name), write, delete, lambda: None
+                )
+                with self.assertRaises(OSError):
+                    manager.restore()
+                self.assertEqual({failed_name: backup[failed_name]},
+                                 config["tp_settings_backup"])
+                self.assertEqual("off", config["three_finger_mode"])
+                self.assertFalse(config["tp_settings_applied"])
+
+    def test_restore_final_persistence_failure_keeps_full_backup_recoverable(self):
+        config = {
+            "three_finger_mode": "swipes",
+            "tp_settings_applied": True,
+            "tp_settings_backup": {"A": 10, "B": None},
+        }
+        values = {"A": 1, "B": 2}
+        saves = 0
+
+        def save():
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                raise OSError("final config save failed")
+
+        manager = TouchpadSettingsManager(
+            config,
+            lambda name: values.get(name),
+            lambda name, value: values.__setitem__(name, value),
+            lambda name: values.pop(name, None),
+            save,
+        )
+        with self.assertRaises(OSError):
+            manager.restore()
+
+        self.assertEqual({"A": 10, "B": None}, config["tp_settings_backup"])
+        self.assertEqual("off", config["three_finger_mode"])
+        self.assertFalse(config["tp_settings_applied"])
+
+    def test_precision_touchpad_registry_has_one_dword_writer_adapter(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        dword_writes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "SetValueEx"
+            and any(
+                isinstance(arg, ast.Attribute) and arg.attr == "REG_DWORD"
+                for arg in node.args
+            )
+        ]
+        self.assertEqual(1, len(dword_writes))
+
 
 class BatteryTests(unittest.TestCase):
     @staticmethod
@@ -1491,6 +1682,221 @@ class BatteryTests(unittest.TestCase):
                          format_battery_label("Magic Trackpad", unavailable))
         self.assertEqual("Magic Trackpad battery: unsupported report",
                          format_battery_label("Magic Trackpad", unsupported))
+
+
+class GestureHardeningTests(unittest.TestCase):
+    @staticmethod
+    def _gesture(mode="swipes"):
+        actions = []
+        suppression = mock.Mock()
+        gesture_type = InputLifecycleTests._load_app_definition(
+            "ThreeFingerDrag",
+            {
+                "ctypes": ctypes,
+                "w": wintypes,
+                "time": time,
+                "threading": threading,
+                "suppress_pointer": suppression,
+                "config_value": lambda key: {
+                    "three_finger_mode": mode,
+                    "drag_gain": 1.0,
+                    "drag_grace_ms": 350,
+                    "drag_start_units": 30,
+                    "swipe_units": 300,
+                }[key],
+                "contacts_are_stable": lambda entries, now, fresh, min_age: (
+                    bool(entries)
+                    and all(now - entry[2] <= fresh for entry in entries)
+                    and all(now - entry[5] >= min_age for entry in entries)
+                ),
+                "expire_stale_contacts": expire_stale_contacts,
+                "should_suppress_pointer": should_suppress_pointer,
+                "actions": mock.Mock(put=actions.append),
+                "SWIPE_ACTIONS": {
+                    "left": "left", "right": "right", "up": "up", "down": "down"
+                },
+                "release_custom_input": release_custom_input,
+                "require_single_input": require_single_input,
+                "INPUT": object,
+                "MOUSEINPUT": object,
+                "MAGIC_EXTRA": 1,
+                "user32": object(),
+                "kernel32": object(),
+                "is_target_trackpad_path": lambda path: True,
+                "run_input_callback": run_input_callback,
+                "append_error": lambda message: None,
+            },
+        )
+        gesture = object.__new__(gesture_type)
+        gesture._touch = {}
+        gesture._pp = {}
+        gesture._links = {}
+        gesture._is_tp = {}
+        gesture.TOUCH_TTL = 0.07
+        gesture.FRESH = 0.06
+        gesture.MIN_AGE = 0.06
+        gesture.MAX_CONTACT_JUMP = 1500
+        gesture.ALL_UP_DEBOUNCE = 0.05
+        gesture._state = "idle"
+        gesture._anchor = gesture._last = None
+        gesture._grace_deadline = 0.0
+        gesture._residual = [0.0, 0.0]
+        gesture._all_up_since = None
+        gesture._swipe_fired = False
+        return gesture, actions, suppression
+
+    @staticmethod
+    def _entry(x, y, now, born=0.0):
+        return [x, y, now, x, y, born]
+
+    def test_reused_contact_id_large_jump_reanchors_without_drag_cursor_move(self):
+        gesture, _, _ = self._gesture("drag")
+        gesture._state = "dragging"
+        gesture._touch[(7, 1)] = self._entry(100, 100, 1.0)
+        gesture._contacts = lambda hdev, rep: [(1, 5000, 5000, True)]
+        moves = []
+        gesture._move = lambda dx, dy: moves.append((dx, dy))
+
+        with mock.patch("time.monotonic", return_value=1.01):
+            gesture._frame(7, b"report")
+
+        self.assertEqual([], moves)
+        self.assertEqual([5000, 5000, 1.01, 5000, 5000, 1.01],
+                         gesture._touch[(7, 1)])
+        self.assertEqual("grace", gesture._state)
+
+    def test_reused_id_does_not_turn_fired_epoch_into_duplicate_swipe(self):
+        gesture, actions, _ = self._gesture("swipes")
+        gesture._state = "fired"
+        gesture._swipe_fired = True
+        gesture._touch = {
+            (7, cid): self._entry(100 + cid, 100, 1.0, born=0.0)
+            for cid in (1, 2, 3)
+        }
+        gesture._contacts = lambda hdev, rep: [(1, 5000, 100, True)]
+
+        with mock.patch("time.monotonic", return_value=1.01):
+            gesture._frame(7, b"report")
+        gesture._touch[(7, 1)][0] = 5500
+        gesture._touch[(7, 2)][0] += 500
+        gesture._touch[(7, 3)][0] += 500
+        gesture._process_state(1.07, [])
+
+        self.assertEqual([], actions)
+        self.assertTrue(gesture._swipe_fired)
+
+    def test_touchdown_epoch_survives_two_four_churn_until_debounced_all_up(self):
+        gesture, actions, _ = self._gesture("swipes")
+        gesture._state = "fired"
+        gesture._swipe_fired = True
+        for count in (2, 4, 3):
+            gesture._touch = {
+                (7, cid): self._entry(100 + cid, 100, 2.0, born=0.0)
+                for cid in range(count)
+            }
+            gesture._frame_swipes(count, 2.0)
+        self.assertEqual([], actions)
+        self.assertEqual("fired", gesture._state)
+
+        gesture._touch.clear()
+        gesture._frame_swipes(0, 2.01)
+        self.assertTrue(gesture._swipe_fired)
+        gesture._touch = {
+            (7, cid): self._entry(100 + cid, 100, 2.02, born=0.0)
+            for cid in range(3)
+        }
+        gesture._frame_swipes(3, 2.02)
+        self.assertEqual("fired", gesture._state)
+
+        gesture._touch.clear()
+        gesture._frame_swipes(0, 2.03)
+        gesture._frame_swipes(0, 2.09)
+        self.assertFalse(gesture._swipe_fired)
+        self.assertEqual("idle", gesture._state)
+
+    def test_silence_expiry_fails_open_but_does_not_skip_all_up_debounce(self):
+        gesture, _, suppression = self._gesture("swipes")
+        gesture._state = "fired"
+        gesture._swipe_fired = True
+        gesture._touch = {
+            (7, cid): self._entry(100, 100, 3.0, born=2.0) for cid in range(3)
+        }
+
+        gesture._process_state(3.08, [])
+
+        self.assertEqual({}, gesture._touch)
+        suppression.set.assert_called_with(False)
+        self.assertTrue(gesture._swipe_fired)
+
+    def test_disconnect_clears_only_that_device_and_releases_input(self):
+        gesture, _, suppression = self._gesture("drag")
+        gesture._state = "dragging"
+        gesture._touch = {
+            (7, 1): self._entry(100, 100, 1.0),
+            (8, 1): self._entry(200, 200, 1.0),
+        }
+        released = []
+        gesture._button = lambda down: released.append(down)
+
+        gesture.device_disconnected(7)
+
+        self.assertEqual({}, gesture._touch)
+        self.assertEqual([False], released)
+        suppression.set.assert_called_with(False)
+        self.assertEqual("idle", gesture._state)
+
+    def test_parser_modeoff_restore_and_shutdown_paths_all_fail_open(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        self.assertIn("self.abort_gesture", source[source.index("if msg == self.WM_INPUT"):])
+        self.assertIn("three_finger_drag.abort_gesture", source[source.index("def on_mode_off"):])
+        self.assertIn("three_finger_drag.abort_gesture", source[source.index("def on_restore_tp"):])
+        self.assertIn("shutdown_custom_input(\n        three_finger_drag.abort_gesture", source)
+        self.assertIn("RIDEV_DEVNOTIFY", source)
+        self.assertIn("WM_INPUT_DEVICE_CHANGE", source)
+
+    def test_parser_emits_lift_for_every_tip_confidence_matrix_entry(self):
+        gesture, _, _ = self._gesture("swipes")
+        gesture._links = {7: [3]}
+        gesture._preparsed = lambda hdev: object()
+
+        class Hid:
+            usages = set()
+
+            @staticmethod
+            def HidP_GetUsageValue(kind, page, link, usage, value, pp, rep, length):
+                ctypes.cast(value, ctypes.POINTER(ctypes.c_ulong))[0] = {
+                    gesture.U_X: 100,
+                    gesture.U_Y: 200,
+                    gesture.U_CID: 9,
+                }[usage]
+                return gesture.HIDP_SUCCESS
+
+            def HidP_GetUsages(self, kind, page, link, values, count, pp, rep, length):
+                for index, usage in enumerate(sorted(self.usages)):
+                    values[index] = usage
+                ctypes.cast(count, ctypes.POINTER(ctypes.c_ulong))[0] = len(self.usages)
+                return gesture.HIDP_SUCCESS
+
+        gesture.hid = Hid()
+        for tip, confidence in ((False, False), (False, True),
+                                (True, False), (True, True)):
+            with self.subTest(tip=tip, confidence=confidence):
+                gesture.hid.usages = {
+                    usage for enabled, usage in (
+                        (tip, gesture.U_TIP), (confidence, gesture.U_CONF)
+                    ) if enabled
+                }
+                contacts = gesture._contacts(7, b"report")
+                self.assertEqual([(9, 100, 200, tip and confidence)], contacts)
+
+    def test_injected_or_app_tagged_mouse_events_bypass_suppression(self):
+        move = 0x0200
+        self.assertFalse(should_suppress_mouse_event(move, 0x01, 0, True))
+        self.assertFalse(should_suppress_mouse_event(move, 0, 0x50454152, True))
+        self.assertTrue(should_suppress_mouse_event(move, 0, 0, True))
+        self.assertFalse(should_suppress_mouse_event(move, 0, 0, False))
 
 
 class ContactSuppressionTests(unittest.TestCase):
