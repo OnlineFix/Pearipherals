@@ -177,6 +177,43 @@ was invoked.
 These are the only remaining Phase 4 checks. The current saved gesture mode is
 `off`, so enable **Swipes** before testing custom three-finger mappings.
 
+### Smart App Control signing blocker
+
+The deployed local PyInstaller executable is unsigned. Windows Code Integrity
+event 3077 confirmed that Smart App Control rejected this exact EXE because it
+did not meet signing-level requirements; this was not a malware detection.
+Smart App Control has no per-app **Run anyway** exception. The user disabled SAC
+to launch this build, and Windows now reports `SmartAppControlState=Off`,
+`SAC_PreviousState=1`.
+
+The selected permanent distribution path is free open-source signing through
+SignPath Foundation. Repository preparation now includes an OSS code-signing
+policy, privacy policy, a complete hash-locked release dependency set,
+deterministic Windows version metadata, release metadata/security tests, and a
+GitHub-hosted build/sign workflow that uploads the unsigned artifact before
+SignPath submission. The hardened preparation passed an independent fail-closed
+review, 81 tests, `py_compile`, clean isolated hash-locked install/build,
+`actionlint`, and `zizmor` with no findings. Actual trusted signing remains
+blocked on SignPath Foundation approval plus the organization/project/policy
+configuration and API token issued after approval.
+
+### Acceptance progress after reboot
+
+- **Passed:** tray menu opens normally.
+- **Passed:** separate keyboard and trackpad battery labels are visible; the user
+  observed keyboard `100%` and trackpad `99%`.
+- **Needs reproduction:** after one restart the trackpad produced no pointer and
+  no cursor was visible until the user power-cycled the trackpad. Current
+  post-recovery diagnostics show both Pearipherals processes responsive, the
+  autostart process launched nine seconds after Explorer, saved gesture mode
+  `off`, no `pearipherals.err.log`, the full Magic Trackpad PnP stack `OK`,
+  `AmtPtpHidFilter` attached, and the Apple vendor HID collection enumerable.
+  This currently points more strongly to a Bluetooth/PTP initialization race
+  than active Pearipherals suppression, but the issue must be reproduced before
+  acceptance can pass. If it recurs, exit Pearipherals before power-cycling the
+  trackpad: pointer recovery on app exit implicates Pearipherals; no recovery
+  until the trackpad reconnects implicates the Bluetooth/driver path.
+
 1. Confirm the Pearipherals tray icon is visible (possibly under the tray
    overflow arrow); open it and confirm keyboard/trackpad battery labels appear.
 2. A/B pointer lag: move one finger with Pearipherals running, use tray **Quit**

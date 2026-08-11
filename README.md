@@ -86,8 +86,12 @@ laptop panels and monitors with no DDC support.
 3. Run it — done. It sets up autostart and the right touchpad settings on
    first launch, and lives in your tray.
 
-> Windows SmartScreen may warn on first run (unsigned exe) — click
-> "More info" → "Run anyway". You can always build it from source instead.
+> **Signing status:** the existing v1.1 binary is unsigned and can be blocked by
+> Windows Smart App Control, which has no per-app **Run anyway** exception. Do
+> not disable a system-wide security feature just for an unsigned development
+> build. Official signed release binaries will be published after the project's
+> free open-source SignPath application is approved. You can always inspect and
+> build the source yourself.
 
 Upgrading from MagicSuite? Just run the new exe — it picks up your old
 `magicsuite.json` settings and cleans up the old autostart entry. Delete the
@@ -95,8 +99,15 @@ old exe afterwards.
 
 ## Uninstall
 
-Tray → untick **Start with Windows** → **Touchpad settings → Restore Windows
-defaults** → **Quit** → delete the exe. Nothing else is left behind.
+1. Tray → untick **Start with Windows**.
+2. Select **Touchpad settings → Restore original Windows settings**.
+3. Select **Quit**.
+4. Delete `Pearipherals.exe` and its adjacent runtime files, if present:
+   `pearipherals.json` and `pearipherals.err.log`.
+
+This removes Pearipherals, its autostart entry, its local configuration/log, and
+replays the Windows touchpad values that were backed up before Pearipherals first
+managed them.
 
 ## Building from source
 
@@ -135,6 +146,13 @@ The exe lands in `dist\Pearipherals.exe`. Or just run `build.bat`.
 - 4-finger gestures aren't handled (yet)
 - The Fn key itself is invisible to Windows (Apple vendor-page only over
   Bluetooth) — that's why the F-row layer exists
+
+## Release signing and privacy
+
+Pearipherals is preparing free open-source code signing through SignPath. See
+our [code signing policy](CODE_SIGNING_POLICY.md) for release provenance and
+project roles. See [PRIVACY.md](PRIVACY.md) for the privacy policy; the app does
+not collect or transmit personal data.
 
 ## License
 
