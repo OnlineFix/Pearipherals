@@ -1765,6 +1765,26 @@ class GestureHardeningTests(unittest.TestCase):
                          gesture._touch[(7, 1)])
         self.assertEqual("grace", gesture._state)
 
+    def test_padding_contact_id_cannot_turn_two_fingers_into_three(self):
+        gesture, actions, suppression = self._gesture("swipes")
+        gesture._touch = {
+            (7, 7): self._entry(3700, 1700, 1.0, born=0.0),
+            (7, 11): self._entry(2600, 1400, 1.0, born=0.0),
+        }
+        gesture._contacts = lambda hdev, rep: [
+            (7, 3720, 1680, True),
+            (11, 2620, 1380, True),
+            (0xFFFF, 0, 0, True),
+        ]
+
+        with mock.patch("time.monotonic", return_value=1.01):
+            gesture._frame(7, b"report")
+
+        self.assertEqual({(7, 7), (7, 11)}, set(gesture._touch))
+        suppression.set.assert_called_with(False)
+        self.assertEqual("idle", gesture._state)
+        self.assertEqual([], actions)
+
     def test_reused_id_does_not_turn_fired_epoch_into_duplicate_swipe(self):
         gesture, actions, _ = self._gesture("swipes")
         gesture._state = "fired"

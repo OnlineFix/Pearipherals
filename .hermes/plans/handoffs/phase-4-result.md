@@ -236,4 +236,57 @@ configuration and API token issued after approval.
    sleeps, and after it wakes; confirm percentages/state recover without
    restarting the app.
 
+### Two-finger false-third-contact hotfix — 2026-08-14
+
+The user reported that two-finger scrolling was intermittently treated as a
+three-finger contact. Two non-invasive Raw Input traces were captured while the
+saved gesture mode was safely `off`; no device restart or hardware mutation was
+performed. The first trace contained 718 sampled table states and stayed at
+exactly two contacts. The transition/reposition trace contained 570 states
+(`n=0`: 6, `n=1`: 475, `n=2`: 89) and exposed six retained rows for padding CID
+`65535` at `(0, 0)`. Production already described CID 65535 as padding but only
+rejected it when its coordinates exceeded 30000, so the zero-coordinate form
+entered the rolling contact table and could arm or qualify false three-contact
+state alongside two real contacts.
+
+Strict TDD evidence:
+
+1. `test_padding_contact_id_cannot_turn_two_fingers_into_three` was added first.
+2. The focused discovery run failed as expected because `(7, 65535)` remained
+   in the production touch table.
+3. `_frame` now rejects CID `0xFFFF` at ingestion, before it can affect table
+   cardinality, gesture arming, or pointer suppression.
+4. The focused test passed, followed by the complete suite: `Ran 82 tests in
+   1.828s` — `OK`. `py_compile`, working/staged diff checks, and trace replay
+   filtering also passed; all six observed padding rows are rejected.
+
+The corrected versioned one-file/windowed build used PyInstaller 6.21.0 and
+version `1.2.0`. Staged artifact evidence:
+
+- Path: `build/two-finger-fix-stage/dist/Pearipherals.exe`
+- Size: `19,199,047` bytes
+- SHA-256: `58DF87838DDB6D1263C804F8661E08221BA97BCDE1B9C2D35A97A9D163399D1B`
+- x64 PE32+, subsystem 2 (`WINDOWS_GUI`), version metadata 1.2.0
+- Required frozen imports present; warnings remained limited to expected
+  optional/cross-platform modules
+- Mutex launch against the old live app exited 0 without creating staging
+  sidecars or another process
+
+Before replacement, hash-verified rollback copies were saved under
+`dist/rollback-two-finger-8a68cd8-20260814`:
+
+- Previous EXE: `19,197,807` bytes, SHA-256
+  `C3C69B89A3A2F9A1E2B46B6396B477408E24A5383EED45B89C9A3A9A09BC5EB0`
+- Preserved config: `434` bytes, SHA-256
+  `9096033E44497FA72E67545CF00CCB418932DA5C3858D93075D02D8BA3D50BFE`
+
+Only the exact live Pearipherals parent/child pair (PIDs 15608/15636) was
+stopped through its pystray windows. The verified artifact was deployed to
+`dist/Pearipherals.exe`; the config hash stayed unchanged. Restart checks found
+the expected responsive parent/child pair (PIDs 6320/7016), two initialized
+`Pearipherals...SystemTrayIcon` windows, the `PearipheralsTFD` Raw Input window,
+no error log, unchanged HKCU Run target, and no extra processes after a second
+launch. Physical confirmation that two-finger scrolling no longer triggers
+three-finger behavior remains required; the saved gesture mode is still `off`.
+
 Do not mark these physical checks passed until the user reports their results.

@@ -1218,8 +1218,8 @@ class ThreeFingerDrag:
         # collecting per-contact motion deltas.
         moved = []
         for cid, x, y, tip in self._contacts(hdev, rep):
-            if x > 30000 or y > 30000:
-                continue          # garbage/padding contact (e.g. id 65535)
+            if cid == 0xFFFF or x > 30000 or y > 30000:
+                continue          # garbage/padding contact
             key = (hdev, cid)
             if tip:
                 e = self._touch.get(key)
