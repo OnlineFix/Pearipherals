@@ -1,8 +1,8 @@
 # Code signing policy
 
-Official Pearipherals release executables are intended to be built from the public source repository and signed through SignPath.io using a certificate provided by SignPath Foundation.
+Pearipherals intends official release executables to be built from the public source repository and signed through SignPath.io using a certificate provided by SignPath Foundation if the project is approved and trusted signing is configured.
 
-Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+If approved, free code signing would be provided by [SignPath.io](https://signpath.io/), with a certificate provided by [SignPath Foundation](https://signpath.org/).
 
 ## Project roles
 
@@ -16,11 +16,32 @@ As the project grows, changes from outside contributors must be reviewed before 
 - Source repository: <https://github.com/OnlineFix/Pearipherals>
 - Official downloads: <https://github.com/OnlineFix/Pearipherals/releases>
 - Release builds run on GitHub-hosted Windows runners.
-- The unsigned artifact is uploaded by the same GitHub Actions workflow before being submitted to SignPath.
-- SignPath verifies the GitHub build origin and returns the signed artifact.
+- If trusted signing is configured, the unsigned artifact is uploaded by the same GitHub Actions workflow before being submitted to SignPath.
+- SignPath would then verify the GitHub build origin and return the signed artifact.
 - Only the signed artifact is eligible to be attached to an official release once signing is configured.
 
 Local and pull-request builds are development artifacts and are not official signed releases.
+
+## Unsigned prereleases while trusted signing is unavailable
+
+Until trusted code signing is available, Pearipherals may publish an explicitly labeled unsigned GitHub prerelease so users can test the current open-source build and the project can establish public usage. An unsigned prerelease is not an official signed release and must:
+
+- be built from the public repository by the GitHub-hosted release workflow;
+- pass the complete automated test and compilation gates;
+- contain product and file version metadata matching its release version;
+- use GitHub's prerelease flag;
+- include `unsigned` in the tag, release title, release notes, and downloadable EXE filename;
+- include a SHA-256 checksum;
+- verify `Get-AuthenticodeSignature` returns `NotSigned` and that the PE certificate table is empty;
+- record the exact workflow run URL and source commit SHA;
+- require the release tag to resolve to that same source commit SHA;
+- publish only the individually verified EXE;
+- explain unknown-publisher, SmartScreen, and Smart App Control limitations;
+- explain that SHA-256 detects file mismatch or corruption but does not authenticate the publisher, establish safety, or substitute for a digital signature;
+- never describe the artifact as signed, trusted, or an official signed release except in an explicit negation;
+- never advise users to disable system-wide Windows security protections.
+
+Once trusted signing is configured, official release tags must continue to fail closed unless SignPath returns exactly one correctly signed, timestamped, and verified executable.
 
 ## Privacy
 

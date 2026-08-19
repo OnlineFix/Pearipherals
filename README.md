@@ -89,7 +89,9 @@ trackpad driver.
 ## Download and quick start
 
 1. For Magic Trackpad 2, install the mac-precision-touchpad driver.
-2. Download `Pearipherals.exe` from [GitHub Releases](../../releases).
+2. Download the latest build from [GitHub Releases](../../releases). Unsigned
+   downloads are identified in their release title, notes, and EXE filename;
+   check the applicable release notes before downloading.
 3. Put it anywhere you control, such as `C:\Tools\Pearipherals`.
 4. Run it. Pearipherals enables autostart and applies the touchpad settings its
    gestures need on first launch, then shows a notification explaining what
@@ -100,11 +102,12 @@ the EXE as `pearipherals.json` and `pearipherals.err.log`.
 
 ## Windows security, unsigned builds, and Smart App Control
 
-The current public Windows build is **unsigned**. Windows may identify it as an
-unknown or untrusted publisher, Microsoft Defender SmartScreen may warn about it,
-and Smart App Control may block it completely. Smart App Control does not offer a
-per-app **Run anyway** exception. Do not disable a system-wide Windows security
-feature just to run an unsigned build.
+An **unsigned** prerelease has no Authenticode signature, so Windows cannot
+verify its publisher identity. Windows may identify it as an unknown or
+untrusted publisher, Microsoft Defender SmartScreen may warn about it, and Smart
+App Control may block it completely. Smart App Control does not offer a per-app
+**Run anyway** exception. Do not disable a system-wide Windows security feature
+just to run an unsigned build.
 
 This warning is about publisher identity and software reputation; it is not by
 itself a malware verdict. Pearipherals is public so you can inspect the source
@@ -115,7 +118,10 @@ The project applied for free open-source signing through SignPath Foundation.
 The application was not accepted because Pearipherals is still new and does not
 yet have enough established public usage. We plan to apply again after the user
 base grows. Until trusted signing is available, every downloadable binary will
-be labeled clearly as unsigned.
+be labeled accurately. New unsigned downloads published under this policy are
+GitHub prereleases accompanied by a SHA-256 checksum. The checksum can detect a
+file mismatch or corruption; it does not authenticate the publisher, establish
+that the program is safe, or substitute for a digital signature.
 
 ## App behavior and safety
 
