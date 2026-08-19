@@ -65,6 +65,13 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertIn("path: release/Pearipherals.exe", workflow)
         self.assertNotIn("path: signed/**/Pearipherals.exe", workflow)
 
+    def test_release_workflow_uses_available_windows_python(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        # Python.org's final 3.11 Windows installer is 3.11.9; later 3.11
+        # security releases are source-only and absent from setup-python's
+        # Windows tool manifest.
+        self.assertIn('python-version: "3.11.9"', workflow)
+
     def test_uninstall_documents_all_runtime_sidecars(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         uninstall = readme.split("## Uninstall", 1)[1].split("## Building", 1)[0]
