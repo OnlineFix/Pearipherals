@@ -1,165 +1,234 @@
-# Pearipherals
+# Pearipherals: Apple Magic Keyboard and Magic Trackpad 2 for Windows
 
-**Apple's peripherals, minus the Apple computer. Make a Magic Keyboard +
-Magic Trackpad 2 feel at home on Windows — one portable exe, no install, free.**
+**Pearipherals is a free, open-source Windows tray app for the Apple Magic
+Keyboard and Magic Trackpad 2. It adds Mac-style function keys, three-finger
+trackpad gestures, battery levels, natural scrolling, and display brightness
+controls in one portable EXE.**
 
-Windows pairs Apple's Bluetooth peripherals fine, but leaves them half-broken:
-the trackpad acts as a dumb 2-button mouse and the keyboard's F-row does
-nothing Mac-like. Magic in, tragic out. The paid tools fix this behind a
-license — Pearipherals is the free, open-source alternative.
+Windows can pair Apple's Bluetooth keyboard and trackpad, but support is limited.
+The Magic Keyboard function row does not behave like it does on a Mac, Windows
+cannot reliably recognize three-finger gestures from the Bluetooth Magic
+Trackpad 2, and peripheral battery levels are hard to find. Pearipherals fills
+those gaps without a subscription or proprietary driver.
 
-Three parts, one tray app:
+## Features
 
-| | |
+| Feature | What it does |
 |---|---|
-| **Tragic Keyboard** | Mac-style function row for the Magic Keyboard |
-| **Tragic Trackpad** | three-finger gestures the Bluetooth driver won't do |
-| **Moodio Display** | brightness for the Studio Display (and any other monitor) |
+| **"Tragic" Keyboard** | Mac-style function row for an Apple Magic Keyboard on Windows |
+| **"Tragic" Trackpad** | Three-finger swipes or drag for Magic Trackpad 2 on Windows |
+| **"Moodio" Display** | Brightness keys for Apple Studio Display and other monitors |
+| **Battery monitoring** | Separate Magic Keyboard and Magic Trackpad battery levels in the tray |
+| **Portable Windows app** | One EXE, local configuration, no account, no telemetry |
 
-## Tragic Keyboard — Mac-style function row
+## "Tragic" Keyboard: Apple function keys on Windows
 
 | Key | Action |
-|-----|--------|
-| F1 / F2 | Display brightness down / up (via Moodio) |
+|---|---|
+| F1 / F2 | Display brightness down / up through "Moodio" |
 | F3 | Task View (Mission Control) |
-| F4 | Search (Spotlight) |
+| F4 | Windows Search (Spotlight) |
 | F5 / F6 | Passthrough |
 | F7 / F8 / F9 | Previous / Play-Pause / Next |
 | F10 / F11 / F12 | Mute / Volume down / Volume up |
 
-Hold **any modifier** (Ctrl/Alt/Shift/Win) to get the raw F-key —
-Alt+F4, Ctrl+F5 etc. all work unchanged. Toggle the whole layer from the
-tray icon.
+Hold **Ctrl, Alt, Shift, or Win** to send the original F-key. Shortcuts such as
+Alt+F4 and Ctrl+F5 continue to work. You can turn the entire layer on or off from
+the tray menu.
 
-## Tragic Trackpad — three-finger gestures that actually work
+## "Tragic" Trackpad: Magic Trackpad 2 gestures on Windows
 
-The Magic Trackpad 2's Bluetooth driver reports contacts one at a time, which
-breaks Windows' native 3-finger gesture detection entirely. Tragic Trackpad
-reassembles the touch data itself (Raw Input + per-contact tracking) and
-gives you a choice of 3-finger behavior from the tray:
+The Magic Trackpad 2 Bluetooth driver reports contacts one at a time. That stops
+Windows from reliably detecting native three-finger gestures. "Tragic" Trackpad
+reassembles the Raw Input contact data and provides three modes:
 
-- **Swipes** (default, mac-like navigation):
-  - swipe **down** → minimize all windows
-  - swipe **up** → restore them back
-  - swipe **left/right** → app switcher (Task View)
-- **Drag** — macOS-style three-finger drag: move windows, select text,
-  with a grace period so you can lift and reposition mid-drag
-- **Off** — hand the gesture back to Windows
+- **Swipes**
+  - swipe **down** to minimize all windows
+  - swipe **up** to restore minimized windows
+  - swipe **left or right** to open Task View
+- **Drag** for macOS-style three-finger dragging and text selection
+- **Off** to disable Pearipherals' custom three-finger handling
 
-Plus a **natural scrolling** toggle (note: Windows applies scroll direction
-when the trackpad connects — flip the trackpad's power switch off/on after
-toggling, or reboot).
+Two-finger scrolling and normal pointer movement remain with the Windows
+Precision Touchpad driver. Pearipherals also has a natural-scrolling toggle.
+Windows reads that setting when the trackpad connects, so reconnect the trackpad
+or reboot after changing it.
 
-## Moodio Display — brightness that finds a way
+## "Moodio" Display: Apple Studio Display brightness on Windows
 
-F1/F2 try, in order: Apple Studio Display over USB HID, then DDC/CI for any
-normal external monitor, then GPU gamma-ramp dimming as a last resort. So the
-brightness keys do something sensible on basically any display, including
-laptop panels and monitors with no DDC support.
+F1 and F2 try three brightness methods in order:
 
-## App behavior
+1. Apple Studio Display USB HID control
+2. DDC/CI for compatible external monitors
+3. GPU gamma-ramp dimming as a fallback
 
-- Single portable exe, config sits next to it (`pearipherals.json`)
-- First run: enables autostart + applies the touchpad settings the gestures
-  need (originals backed up, restorable from the tray), then says so in a
-  notification so you know what changed and where to undo it
-- Tray icon: every feature can be toggled or reverted; **Quit** stops everything
-- Crash-resilient: auto-retries at logon, errors logged to `pearipherals.err.log`
-- Single-instance guard — safe to double-launch
-- Moving the exe? Run it once from the new location — autostart re-points itself
+This gives the brightness keys a useful fallback on displays that do not expose
+normal DDC controls. A video-only USB-C-to-DisplayPort cable cannot carry the
+Studio Display's USB control data, so Pearipherals uses the available fallback in
+that setup.
 
-## Requirements
+## Magic Keyboard and Magic Trackpad battery levels
 
-1. **Windows 10/11**, Magic Keyboard / Magic Trackpad 2 paired over Bluetooth
-2. For the trackpad: the open-source
-   [mac-precision-touchpad](https://github.com/imbushuo/mac-precision-touchpad)
-   driver (signed, free) — this is what turns the trackpad into a real
-   Windows Precision Touchpad with pointer + 2-finger scrolling. Tragic
-   Trackpad builds on top of it for everything the driver can't deliver.
-   The keyboard features work without any driver.
+Pearipherals shows the Apple Magic Keyboard and Magic Trackpad battery levels as
+separate entries in the tray menu. Battery polling is slow and isolated, and the
+app reopens devices for each poll instead of keeping Bluetooth HID handles open
+while a device sleeps.
 
-## Quick start
+## Supported hardware and requirements
 
-1. Install the mac-precision-touchpad driver (trackpad only, once)
-2. Download `Pearipherals.exe` from [Releases](../../releases) and put it
-   anywhere (USB stick, Dropbox, `C:\Tools`, …)
-3. Run it — done. It sets up autostart and the right touchpad settings on
-   first launch, and lives in your tray.
+- Windows 10 or Windows 11
+- Apple Magic Keyboard connected over Bluetooth
+- Apple Magic Trackpad 2 connected over Bluetooth
+- For trackpad pointer movement and two-finger scrolling, install the free,
+  signed [mac-precision-touchpad](https://github.com/imbushuo/mac-precision-touchpad)
+  driver once
 
-> **Signing status:** the existing v1.1 binary is unsigned and can be blocked by
-> Windows Smart App Control, which has no per-app **Run anyway** exception. Do
-> not disable a system-wide security feature just for an unsigned development
-> build. Official signed release binaries will be published after the project's
-> free open-source SignPath application is approved. You can always inspect and
-> build the source yourself.
+The keyboard mappings, battery display, and monitor controls do not require that
+trackpad driver.
 
-Upgrading from MagicSuite? Just run the new exe — it picks up your old
-`magicsuite.json` settings and cleans up the old autostart entry. Delete the
-old exe afterwards.
+## Download and quick start
+
+1. For Magic Trackpad 2, install the mac-precision-touchpad driver.
+2. Download `Pearipherals.exe` from [GitHub Releases](../../releases).
+3. Put it anywhere you control, such as `C:\Tools\Pearipherals`.
+4. Run it. Pearipherals enables autostart and applies the touchpad settings its
+   gestures need on first launch, then shows a notification explaining what
+   changed and where to undo it.
+
+Pearipherals is portable. Its configuration and optional error log sit beside
+the EXE as `pearipherals.json` and `pearipherals.err.log`.
+
+## Windows security, unsigned builds, and Smart App Control
+
+The current public Windows build is **unsigned**. Windows may identify it as an
+unknown or untrusted publisher, Microsoft Defender SmartScreen may warn about it,
+and Smart App Control may block it completely. Smart App Control does not offer a
+per-app **Run anyway** exception. Do not disable a system-wide Windows security
+feature just to run an unsigned build.
+
+This warning is about publisher identity and software reputation; it is not by
+itself a malware verdict. Pearipherals is public so you can inspect the source
+and build it locally. Official release provenance is documented in the
+[Code signing policy](CODE_SIGNING_POLICY.md).
+
+The project applied for free open-source signing through SignPath Foundation.
+The application was not accepted because Pearipherals is still new and does not
+yet have enough established public usage. We plan to apply again after the user
+base grows. Until trusted signing is available, every downloadable binary will
+be labeled clearly as unsigned.
+
+## App behavior and safety
+
+- The tray menu controls the function-key layer, gesture mode, natural
+  scrolling, autostart, and touchpad setting recovery.
+- **Quit** stops input hooks, Raw Input handling, and battery polling.
+- Original Windows touchpad values are backed up before Pearipherals changes
+  them and can be restored from the tray.
+- A single-instance guard makes accidental double launches safe.
+- Startup failures are retried and written to `pearipherals.err.log`.
+- Moving the EXE is supported: run it once from the new location and the
+  autostart path updates.
+- Pearipherals has no account, analytics, telemetry, or automatic uploads. See
+  the [privacy policy](PRIVACY.md).
+
+## Upgrade from MagicSuite
+
+Run Pearipherals once from its new location. It imports the old
+`magicsuite.json` settings and removes the legacy autostart entry. You can then
+delete the old MagicSuite EXE.
 
 ## Uninstall
 
-1. Tray → untick **Start with Windows**.
+1. In the tray, untick **Start with Windows**.
 2. Select **Touchpad settings → Restore original Windows settings**.
 3. Select **Quit**.
 4. Delete `Pearipherals.exe` and its adjacent runtime files, if present:
    `pearipherals.json` and `pearipherals.err.log`.
 
-This removes Pearipherals, its autostart entry, its local configuration/log, and
-replays the Windows touchpad values that were backed up before Pearipherals first
-managed them.
+This removes Pearipherals, its autostart entry, and its local configuration/log.
+The Restore action replays the Windows touchpad values backed up before
+Pearipherals first managed them.
 
-## Building from source
+## Build Pearipherals from source
 
-```
+```bat
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\pyinstaller --onefile --windowed --name Pearipherals --icon pearipherals.ico --hidden-import pystray._win32 pearipherals.py
+set PEARIPHERALS_VERSION=1.2.0
+build.bat
 ```
 
-The exe lands in `dist\Pearipherals.exe`. Or just run `build.bat`.
+The portable Windows executable is written to `dist\Pearipherals.exe`. The
+release workflow uses a complete hash-locked dependency set and adds Windows
+product/version metadata before signing submission.
 
-## How it works (for the curious)
+## How Pearipherals works
 
-- **F-row**: a low-level keyboard hook (`WH_KEYBOARD_LL`) intercepts F1–F12,
-  swallows them, and injects media/brightness actions. Modifier-held presses
-  pass through untouched. Injected events are tagged so the hook never loops.
-- **Brightness**: tries Apple Studio Display USB HID (protocol from
-  [asdbctl](https://github.com/juliuszint/asdbctl)), then DDC/CI via
-  `dxva2.dll`, then falls back to GPU gamma-ramp dimming — so it works on
-  basically any monitor.
-- **Gestures**: registers Raw Input for the Precision Touchpad usage
-  (0x0D/0x05) with `RIDEV_INPUTSINK` and parses per-contact X/Y/tip through
-  `HidP_*`. Because the Bluetooth driver reports one contact per HID report
-  (which is why native Windows 3-finger gestures never fire), contacts are
-  reassembled in a rolling table keyed by contact ID with freshness/age
-  gates against ghost contacts. A state machine
-  (idle → armed → fired / dragging → grace) turns that into swipes or drag,
-  and a low-level mouse hook freezes the leaked pointer motion while 3
-  fingers are down. Actions go out via `SendInput`. No kernel code, no
-  admin rights.
+- **Keyboard function row:** a low-level keyboard hook (`WH_KEYBOARD_LL`)
+  intercepts F1-F12 and injects the chosen media, brightness, or Windows action.
+  Modifier-held presses pass through untouched. Injected events are tagged so
+  the hook cannot loop.
+- **Display brightness:** Apple Studio Display USB HID is tried first, followed
+  by DDC/CI through `dxva2.dll`, then GPU gamma-ramp dimming.
+- **Trackpad gestures:** Raw Input is registered for the Precision Touchpad usage
+  (`0x0D/0x05`). Pearipherals parses contact data through `HidP_*`, filters
+  padding and stale contacts, and feeds stable contacts into its gesture state
+  machine. A low-level mouse hook suppresses leaked pointer motion only while a
+  valid custom gesture owns the input.
+- **Battery monitoring:** Apple vendor HID battery reports are queried separately
+  for the keyboard and trackpad, then published to the Windows tray thread.
+
+Pearipherals uses no kernel code and does not require administrator rights.
+
+## FAQ
+
+### Does Apple Magic Trackpad 2 work on Windows 11?
+
+Yes. The mac-precision-touchpad driver provides normal Windows Precision
+Touchpad pointer movement and two-finger scrolling. Pearipherals adds the custom
+three-finger gestures, natural-scrolling control, and battery display that the
+Bluetooth setup does not provide reliably by itself.
+
+### Can Apple Magic Keyboard function keys work like a Mac on Windows?
+
+Pearipherals maps F1-F12 to brightness, Task View, Search, media, and volume.
+Holding Ctrl, Alt, Shift, or Win sends the normal F-key instead.
+
+### Can Windows show Magic Keyboard and Magic Trackpad battery levels?
+
+Pearipherals displays separate battery values for supported Apple Magic Keyboard
+and Magic Trackpad devices in its tray menu.
+
+### Is Pearipherals free and open source?
+
+Yes. Pearipherals uses the MIT license, has no paid tier, and does not collect or
+transmit personal data.
+
+### Why does Windows say the publisher is unknown or untrusted?
+
+The current EXE is not signed by a publicly trusted code-signing certificate.
+Windows therefore cannot verify its publisher identity or reputation. Read the
+[Windows security section](#windows-security-unsigned-builds-and-smart-app-control)
+before downloading it.
 
 ## Known limitations
 
-- Scroll direction changes need a trackpad reconnect (Windows caches the
-  setting at device init — nothing an app can do about it)
-- 4-finger gestures aren't handled (yet)
-- The Fn key itself is invisible to Windows (Apple vendor-page only over
-  Bluetooth) — that's why the F-row layer exists
+- Natural-scroll changes require a trackpad reconnect or reboot because Windows
+  caches the setting when the device initializes.
+- Four-finger gestures are not handled yet.
+- The Magic Keyboard Fn key is not exposed to Windows over this Bluetooth path,
+  so Pearipherals uses modifiers to access the original F-keys.
+- Trusted public code signing is not available yet.
 
-## Release signing and privacy
+## Project links
 
-Pearipherals is preparing free open-source code signing through SignPath. See
-our [code signing policy](CODE_SIGNING_POLICY.md) for release provenance and
-project roles. See [PRIVACY.md](PRIVACY.md) for the privacy policy; the app does
-not collect or transmit personal data.
-
-## License
-
-MIT
+- [Releases](../../releases)
+- [Code signing policy](CODE_SIGNING_POLICY.md)
+- [Privacy policy](PRIVACY.md)
+- [MIT license](LICENSE)
 
 ---
 
-Not affiliated with, endorsed by, or sponsored by Apple Inc. Apple, Magic
-Keyboard, Magic Trackpad and Studio Display are trademarks of Apple Inc.,
-used here only to describe the hardware this software supports.
+Pearipherals is not affiliated with, endorsed by, or sponsored by Apple Inc.
+Apple, Magic Keyboard, Magic Trackpad, and Studio Display are trademarks of
+Apple Inc. and are used only to describe supported hardware.

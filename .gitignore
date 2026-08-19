@@ -8,6 +8,10 @@ __pycache__/
 # local environment
 .venv/
 
+# Hermes project context stays local and is never published
+.hermes/
+.hermes.md
+
 # runtime files (live next to the exe, never in git)
 pearipherals.json
 pearipherals.err.log
