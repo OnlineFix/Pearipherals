@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a focused, safe improvement to Pearipherals
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before proposing an implementation. Search existing issues first.
+
+        Remove sensitive information such as usernames, device identifiers, Bluetooth addresses, serial numbers, full local paths, configuration, logs, registry exports and credentials. Do not attach raw HID traces. Report security-sensitive ideas privately through GitHub Security Advisories.
+
+  - type: textarea
+    id: user-problem
+    attributes:
+      label: User problem
+      description: What cannot be done reliably today, and who encounters the problem?
+      placeholder: "When I use ... I cannot ... because ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the observable result, not only a preferred implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or narrower approaches have you tried or considered?
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware-scope
+    attributes:
+      label: Hardware and Windows scope
+      description: Identify relevant Apple product families/revisions, connection paths, Windows releases and driver families without serial numbers or identifiers.
+      placeholder: "Magic Trackpad 2 over Bluetooth on Windows 11 with mac-precision-touchpad ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety-impact
+    attributes:
+      label: Safety, privacy and lifecycle impact
+      description: Explain effects on input handling, synthetic events, registry or autostart state, device access, diagnostics/privacy, setup, upgrades and uninstall/rollback.
+      placeholder: "Input handling: ...; registry: ...; privacy: ...; rollback: ..."
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: The request does not require disabling Windows security protections.
+          required: true
+        - label: I removed sensitive information and did not attach raw traces, full logs/configuration or registry exports.
+          required: true
+        - label: I understand that hardware compatibility claims require real, accurately scoped evidence.
+          required: true

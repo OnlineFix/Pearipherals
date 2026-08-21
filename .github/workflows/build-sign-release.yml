@@ -53,10 +53,11 @@ jobs:
       - name: Install hash-locked build dependencies without cache
         run: python -m pip install --disable-pip-version-check --no-cache-dir --require-hashes -r requirements-build.txt
 
-      - name: Run source verification
-        run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
-          python -m py_compile pearipherals.py pearipherals_core.py scripts/write_version_info.py tests/test_core.py tests/test_release.py
+      - name: Run complete unit test gate
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run byte-compilation gate
+        run: python -m py_compile pearipherals.py pearipherals_core.py scripts/write_version_info.py tests/test_core.py tests/test_release.py
 
       - name: Generate version resource
         run: python scripts/write_version_info.py $env:PEARIPHERALS_VERSION build/pearipherals-version-info.txt
@@ -110,7 +111,7 @@ jobs:
       - name: Submit to SignPath
         id: sign
         if: github.ref_type == 'tag' || inputs.submit_for_signing
-        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2.2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}

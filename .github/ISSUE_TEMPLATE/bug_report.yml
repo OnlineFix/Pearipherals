@@ -1,0 +1,133 @@
+name: Bug report
+description: Report a reproducible Pearipherals problem without exposing private device data
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pearipherals. Search existing issues first and describe only behavior you can reproduce.
+
+        **Privacy:** remove usernames, device identifiers, Bluetooth addresses, serial numbers, full local paths, registry exports, credentials and other sensitive information. Do not attach raw HID traces; collecting or sharing them requires explicit maintainer coordination. Do not upload a complete configuration, error log, crash dump or registry export.
+
+        Suspected security vulnerabilities belong in a private GitHub Security Advisory, not this form.
+
+  - type: input
+    id: pearipherals-version
+    attributes:
+      label: Pearipherals version
+      description: Use the About/version information, release name or source commit. State whether the EXE is an unsigned prerelease.
+      placeholder: "1.2.0 unsigned prerelease"
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Include Windows 10/11, release and OS build; do not include a username or device name.
+      placeholder: "Windows 11 24H2, OS build 26100.x"
+    validations:
+      required: true
+
+  - type: input
+    id: device-model-revision
+    attributes:
+      label: Apple device model and revision
+      description: Identify the product family and visible revision only. Do not include serial numbers, device identifiers or Bluetooth addresses.
+      placeholder: "Magic Trackpad 2, model A1535"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection or display data path
+      description: Select the path relevant to the failure.
+      options:
+        - Bluetooth
+        - USB data
+        - USB-C to DisplayPort video-only
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: input
+    id: driver-version
+    attributes:
+      label: Driver and version
+      description: For trackpad reports, include the mac-precision-touchpad/AmtPtpHidFilter version. Otherwise enter "Not applicable".
+      placeholder: "mac-precision-touchpad version or Not applicable"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest repeatable sequence. Avoid repetitive hardware stress testing.
+      placeholder: |
+        1. Start Pearipherals...
+        2. Select...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include exact redacted error text only when useful.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sleep-wake
+    attributes:
+      label: Sleep/wake or reconnect relevance
+      options:
+        - Not involved
+        - Happens after Windows sleep/wake
+        - Happens after the Apple device sleeps/wakes
+        - Happens after Bluetooth reconnect
+        - Happens after reboot or sign-in
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression-status
+    attributes:
+      label: Regression status
+      description: State whether the same setup worked in an earlier Pearipherals version.
+      options:
+        - New regression from an earlier working version
+        - Never worked on this setup
+        - Intermittent or unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: redacted-context
+    attributes:
+      label: Additional redacted context
+      description: Optional. Paste only the smallest relevant, privacy-reviewed excerpt. Do not attach raw HID traces, complete logs/configuration, full local paths or registry exports.
+
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: Privacy and safety confirmation
+      options:
+        - label: I removed usernames, device identifiers, Bluetooth addresses, serial numbers, full local paths, registry exports and credentials.
+          required: true
+        - label: I did not attach raw HID traces, complete logs/configuration or crash dumps; those require explicit maintainer coordination.
+          required: true
+        - label: I did not disable or recommend disabling Windows security protections to reproduce this report.
+          required: true
