@@ -28,13 +28,18 @@ those gaps without a subscription or proprietary driver.
 | F1 / F2 | Display brightness down / up through "Moodio" |
 | F3 | Task View (Mission Control) |
 | F4 | Windows Search (Spotlight) |
-| F5 / F6 | Passthrough |
+| F5 | Passthrough |
+| F6 | Open the Windows Snipping Tool selection overlay |
 | F7 / F8 / F9 | Previous / Play-Pause / Next |
 | F10 / F11 / F12 | Mute / Volume down / Volume up |
 
 Hold **Ctrl, Alt, Shift, or Win** to send the original F-key. Shortcuts such as
 Alt+F4 and Ctrl+F5 continue to work. You can turn the entire layer on or off from
-the tray menu.
+the tray menu. **F6** without a modifier opens the **Windows Snipping Tool**
+**selection overlay** so you can select a region. Windows handles the selected image,
+copies it to the clipboard, and saves it according to the Snipping Tool **auto-save setting**.
+Pearipherals does not capture or save the image itself. **Modifier+F6**
+passes the original F6 key through instead.
 
 ## "Tragic" Trackpad: Magic Trackpad 2 gestures on Windows
 
@@ -137,6 +142,38 @@ that the program is safe, or substitute for a digital signature.
 - Pearipherals has no account, analytics, telemetry, or automatic uploads. See
   the [privacy policy](PRIVACY.md).
 
+## Check status, get help, and prepare removal
+
+All of this lives in the tray menu and none of it does anything until you click
+it.
+
+- **About / status…** shows the exact version, the full build identity, whether
+  this is a frozen or source build, your Windows version, and the current state
+  of the configuration file, battery paths, `AmtPtpHidFilter` service
+  registration, Raw Input listener, gesture mode, touchpad settings, scroll
+  direction, autostart, and removal readiness. Every value is a fixed label. It
+  reports what Pearipherals can currently observe — a sleeping Bluetooth device
+  simply reads as *not detected*, never as broken or missing.
+- **Save a diagnostic report** writes `pearipherals-diagnostics.json` next to
+  the executable so you can read it before sending it anywhere. It contains a
+  fixed whitelist of the same product-level labels shown in About / status:
+  **no local paths, no usernames, no Bluetooth or HID identifiers, no registry
+  values, no raw configuration, and no log contents.**
+  Pearipherals never uploads it — sharing it is entirely your decision.
+- **Open documentation** and **Report a problem** open fixed project links in
+  your browser, and only when clicked. There is no background update check.
+- **Prepare for removal…** asks for confirmation first (**No** is the default
+  button), then turns off the Mac F-row and three-finger gestures, releases any
+  in-flight gesture, removes and verifies every start-with-Windows entry
+  including legacy names, and restores your backed-up Windows touchpad
+  settings. It reports exactly which steps completed; a partial run is never
+  reported as success. It **does not delete** any file and does not quit the
+  app — you choose **Quit** when you are ready.
+
+When you upgrade, Pearipherals records the previous version and the current one
+in its local configuration so About / status can show that a version change was
+observed. Nothing about that is transmitted.
+
 ## Upgrade from MagicSuite
 
 Run Pearipherals once from its new location. It imports the old
@@ -145,11 +182,15 @@ delete the old MagicSuite EXE.
 
 ## Uninstall
 
-1. In the tray, untick **Start with Windows**.
-2. Select **Touchpad settings → Restore original Windows settings**.
-3. Select **Quit**.
-4. Delete `Pearipherals.exe` and its adjacent runtime files, if present:
-   `pearipherals.json` and `pearipherals.err.log`.
+1. Select **Prepare for removal…** and confirm. This reverses every persistent
+   change in one step and tells you if anything could not be completed.
+   You can still do it by hand instead: untick **Start with Windows**, set the
+   3-finger gesture to **Off**, then use **Touchpad settings** →
+   **Restore original Windows settings**.
+2. Select **Quit**.
+3. Delete `Pearipherals.exe` and its adjacent runtime files, if present:
+   `pearipherals.json`, `pearipherals.err.log`, and
+   `pearipherals-diagnostics.json`.
 
 This removes Pearipherals, its autostart entry, and its local configuration/log.
 The Restore action replays the Windows touchpad values backed up before

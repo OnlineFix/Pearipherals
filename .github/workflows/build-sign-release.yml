@@ -57,10 +57,17 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Run byte-compilation gate
-        run: python -m py_compile pearipherals.py pearipherals_core.py scripts/write_version_info.py tests/test_core.py tests/test_release.py
+        run: python -m py_compile pearipherals.py pearipherals_core.py pearipherals_snipping.py pearipherals_support.py pearipherals_version.py scripts/write_build_manifest.py scripts/write_version_info.py tests/test_core.py tests/test_release.py tests/test_snipping.py tests/test_support.py
 
       - name: Generate version resource
         run: python scripts/write_version_info.py $env:PEARIPHERALS_VERSION build/pearipherals-version-info.txt
+
+      # Generated from the SAME validated version input as the PE resource
+      # above, plus the exact checked-out revision, so a frozen build can name
+      # its source revision independently of Authenticode. Written before
+      # PyInstaller analysis so it can be bundled as one-file data.
+      - name: Generate deterministic build manifest
+        run: python scripts/write_build_manifest.py $env:PEARIPHERALS_VERSION $env:GITHUB_SHA build/pearipherals-build.json
 
       - name: Build unsigned Windows executable
         run: >-
@@ -68,6 +75,7 @@ jobs:
           --name Pearipherals
           --icon pearipherals.ico
           --version-file build/pearipherals-version-info.txt
+          --add-data "build/pearipherals-build.json;."
           --hidden-import pystray._win32
           pearipherals.py
 

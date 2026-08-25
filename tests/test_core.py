@@ -1,4 +1,5 @@
 import ast
+import copy
 import ctypes
 import ctypes.wintypes as wintypes
 import json
@@ -48,6 +49,11 @@ class InputLifecycleTests(unittest.TestCase):
         )
         namespace = dict(globals_)
         namespace.setdefault("time", time)
+        # Definitions that share the support model's fixed wording resolve it at
+        # class-definition time, so the single source of truth must be present.
+        from pearipherals_support import SUPPORT_ENUMS as _SUPPORT_ENUMS
+
+        namespace.setdefault("SUPPORT_ENUMS", _SUPPORT_ENUMS)
         exec(compile(ast.Module([node], []), source_path, "exec"), namespace)
         return namespace[name]
 
@@ -575,6 +581,55 @@ class InputLifecycleTests(unittest.TestCase):
         self.assertEqual("Raw Input callback failed: bad report", events[0])
         self.assertEqual("cleanup", events[1])
 
+    def test_first_run_autostart_failure_blocks_touchpad_mutation_and_success(self):
+        app_config = {}
+        calls = []
+
+        def failing_autostart(enable):
+            calls.append(f"autostart:{enable}")
+            raise OSError(r"registry denied at HKCU\...\Run")
+
+        first_run_setup = self._load_app_definition("first_run_setup", {
+            "config": app_config,
+            "CONFIG_RECOVERY_ERROR": None,
+            "CONFIG_LOCK": threading.RLock(),
+            "config_value": lambda key, default=None: app_config.get(key, default),
+            "autostart_set": failing_autostart,
+            "tp_settings": mock.Mock(apply=lambda: calls.append("apply")),
+            "save_config": lambda config: calls.append("save"),
+            "append_error": lambda message: calls.append(("error", message)),
+        })
+
+        # Onboarding stays pending, so the next launch can retry it honestly.
+        self.assertFalse(first_run_setup())
+        self.assertNotIn("setup_done", app_config)
+        # No touchpad registry mutation and no persisted completion.
+        self.assertNotIn("apply", calls)
+        self.assertNotIn("save", calls)
+
+    def test_first_run_success_toast_claims_no_device_or_driver_detection(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "tray_setup"
+        )
+        toast = " ".join(
+            n.value for n in ast.walk(node)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        ).lower()
+
+        # It may only state what it actually did.
+        self.assertIn("starts with windows", toast)
+        self.assertIn("about / status", toast)
+        for overclaim in (
+            "detected", "found your", "connected", "driver is",
+            "magic keyboard is", "magic trackpad is", "ready to use",
+        ):
+            with self.subTest(overclaim=overclaim):
+                self.assertNotIn(overclaim, toast)
+
     def test_first_run_apply_failure_does_not_mark_setup_done_or_claim_success(self):
         app_config = {}
 
@@ -614,6 +669,254 @@ class InputLifecycleTests(unittest.TestCase):
 
 
 class ConfigPersistenceTests(unittest.TestCase):
+    def test_trustworthy_startup_observes_product_version_transactionally(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        self.assertRegex(
+            source,
+            r"from pearipherals_version import \(?[^)]*\bAPP_VERSION\b",
+        )
+        self.assertRegex(
+            source,
+            r"from pearipherals_support import \(?[^)]*\bobserve_version\b",
+        )
+        self.assertIn(
+            "observe_version(config, APP_VERSION, lambda: save_config(config))",
+            source,
+        )
+
+    def test_config_v6_migration_preserves_unknown_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "pearipherals.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"cfg_version": 5, "future_setting": {"keep": True}}, stream)
+
+            source_path = os.path.join(
+                os.path.dirname(__file__), "..", "pearipherals.py"
+            )
+            with open(source_path, "r", encoding="utf-8") as stream:
+                tree = ast.parse(stream.read(), source_path)
+            defaults_node = next(
+                node for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "DEFAULTS"
+                    for target in node.targets
+                )
+            )
+            defaults = ast.literal_eval(defaults_node.value)
+            saves = []
+            load_config = InputLifecycleTests._load_app_definition(
+                "load_config",
+                {
+                    "CONFIG_LOCK": threading.RLock(),
+                    "CONFIG_PATH": path,
+                    "DEFAULTS": defaults,
+                    "OLD_CONFIG_PATHS": (),
+                    "load_json_config": load_json_config,
+                    "ConfigRecoveryRequired": ConfigRecoveryRequired,
+                    "save_config": lambda cfg: saves.append(copy.deepcopy(cfg)),
+                },
+            )
+
+            migrated = load_config()
+
+        self.assertEqual(6, migrated["cfg_version"])
+        self.assertIsNone(migrated["current_version"])
+        self.assertIsNone(migrated["previous_version"])
+        self.assertIsNone(migrated["legacy_source"])
+        self.assertEqual({"keep": True}, migrated["future_setting"])
+        self.assertEqual([migrated], saves)
+
+    def test_incompatible_primary_config_versions_require_recovery_without_overwrite(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        defaults = ast.literal_eval(next(
+            node.value for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "DEFAULTS"
+                for target in node.targets
+            )
+        ))
+
+        for version in (7, "6", True):
+            with self.subTest(version=version):
+                with tempfile.TemporaryDirectory() as folder:
+                    path = os.path.join(folder, "pearipherals.json")
+                    original = json.dumps({"cfg_version": version}).encode("utf-8")
+                    with open(path, "wb") as stream:
+                        stream.write(original)
+                    saves = []
+                    load_config = InputLifecycleTests._load_app_definition(
+                        "load_config",
+                        {
+                            "CONFIG_LOCK": threading.RLock(),
+                            "CONFIG_PATH": path,
+                            "DEFAULTS": defaults,
+                            "OLD_CONFIG_PATHS": (),
+                            "load_json_config": load_json_config,
+                            "ConfigRecoveryRequired": ConfigRecoveryRequired,
+                            "save_config": lambda cfg: saves.append(dict(cfg)),
+                        },
+                    )
+
+                    with self.assertRaises(ConfigRecoveryRequired) as raised:
+                        load_config()
+
+                    self.assertEqual(path, raised.exception.path)
+                    self.assertEqual([], saves)
+                    with open(path, "rb") as stream:
+                        self.assertEqual(original, stream.read())
+
+    def test_malformed_first_priority_legacy_requires_recovery_without_fallback(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        defaults = ast.literal_eval(next(
+            node.value for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "DEFAULTS"
+                for target in node.targets
+            )
+        ))
+
+        with tempfile.TemporaryDirectory() as folder:
+            primary = os.path.join(folder, "pearipherals.json")
+            first = os.path.join(folder, "magicsuite.json")
+            second = os.path.join(folder, "magickeys.json")
+            malformed = b'{"cfg_version": 5'
+            with open(first, "wb") as stream:
+                stream.write(malformed)
+            with open(second, "w", encoding="utf-8") as stream:
+                json.dump({"cfg_version": 6}, stream)
+            saves = []
+            load_config = InputLifecycleTests._load_app_definition(
+                "load_config",
+                {
+                    "CONFIG_LOCK": threading.RLock(),
+                    "CONFIG_PATH": primary,
+                    "DEFAULTS": defaults,
+                    "OLD_CONFIG_PATHS": (
+                        (first, "MagicSuite"),
+                        (second, "MagicKeys"),
+                    ),
+                    "load_json_config": load_json_config,
+                    "ConfigRecoveryRequired": ConfigRecoveryRequired,
+                    "save_config": lambda cfg: saves.append(dict(cfg)),
+                },
+            )
+
+            with self.assertRaises(ConfigRecoveryRequired) as raised:
+                load_config()
+
+            self.assertEqual(first, raised.exception.path)
+            self.assertEqual([], saves)
+            self.assertFalse(os.path.exists(primary))
+            with open(first, "rb") as stream:
+                self.assertEqual(malformed, stream.read())
+
+    def test_incompatible_first_priority_legacy_requires_recovery_without_fallback(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        defaults = ast.literal_eval(next(
+            node.value for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "DEFAULTS"
+                for target in node.targets
+            )
+        ))
+
+        with tempfile.TemporaryDirectory() as folder:
+            primary = os.path.join(folder, "pearipherals.json")
+            first = os.path.join(folder, "magicsuite.json")
+            second = os.path.join(folder, "magickeys.json")
+            original = json.dumps({"cfg_version": 7}).encode("utf-8")
+            with open(first, "wb") as stream:
+                stream.write(original)
+            with open(second, "w", encoding="utf-8") as stream:
+                json.dump({"cfg_version": 6}, stream)
+            saves = []
+            load_config = InputLifecycleTests._load_app_definition(
+                "load_config",
+                {
+                    "CONFIG_LOCK": threading.RLock(),
+                    "CONFIG_PATH": primary,
+                    "DEFAULTS": defaults,
+                    "OLD_CONFIG_PATHS": (
+                        (first, "MagicSuite"),
+                        (second, "MagicKeys"),
+                    ),
+                    "load_json_config": load_json_config,
+                    "ConfigRecoveryRequired": ConfigRecoveryRequired,
+                    "save_config": lambda cfg: saves.append(dict(cfg)),
+                },
+            )
+
+            with self.assertRaises(ConfigRecoveryRequired) as raised:
+                load_config()
+
+            self.assertEqual(first, raised.exception.path)
+            self.assertEqual([], saves)
+            self.assertFalse(os.path.exists(primary))
+            with open(first, "rb") as stream:
+                self.assertEqual(original, stream.read())
+
+    def test_legacy_adoption_persists_only_fixed_source_label(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        defaults_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "DEFAULTS"
+                for target in node.targets
+            )
+        )
+        defaults = ast.literal_eval(defaults_node.value)
+
+        for filename, label in (
+            ("magicsuite.json", "MagicSuite"),
+            ("magickeys.json", "MagicKeys"),
+        ):
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as folder:
+                    primary = os.path.join(folder, "pearipherals.json")
+                    legacy = os.path.join(folder, filename)
+                    with open(legacy, "w", encoding="utf-8") as stream:
+                        json.dump(
+                            {"cfg_version": 6, "future_setting": "kept"}, stream
+                        )
+                    saves = []
+                    load_config = InputLifecycleTests._load_app_definition(
+                        "load_config",
+                        {
+                            "CONFIG_LOCK": threading.RLock(),
+                            "CONFIG_PATH": primary,
+                            "DEFAULTS": defaults,
+                            "OLD_CONFIG_PATHS": ((legacy, label),),
+                            "load_json_config": load_json_config,
+                            "ConfigRecoveryRequired": ConfigRecoveryRequired,
+                            "save_config": lambda cfg: saves.append(
+                                copy.deepcopy(cfg)
+                            ),
+                        },
+                    )
+
+                    adopted = load_config()
+
+                self.assertEqual(label, adopted["legacy_source"])
+                self.assertEqual("kept", adopted["future_setting"])
+                self.assertEqual(label, saves[0]["legacy_source"])
+                self.assertNotIn(legacy, json.dumps(adopted))
+
     def test_atomic_save_replaces_json_and_leaves_no_temp_file(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "settings.json")
@@ -1969,6 +2272,1743 @@ class ContactSuppressionTests(unittest.TestCase):
 
         self.assertEqual([1], expired)
         self.assertEqual({2, 3}, set(contacts))
+
+
+class AutostartProbeTests(unittest.TestCase):
+    class FakeWinreg:
+        """Minimal read-only winreg stand-in; never touches the real registry."""
+
+        HKEY_CURRENT_USER = "HKCU"
+        KEY_SET_VALUE = 2
+        KEY_QUERY_VALUE = 1
+        REG_SZ = 1
+
+        def __init__(self, values=None, open_error=None, query_error=None):
+            self.values = {} if values is None else dict(values)
+            self.open_error = open_error
+            self.query_error = query_error
+            self.deleted = []
+            self.written = []
+
+        def OpenKey(self, root, path, reserved=0, access=0):
+            if self.open_error is not None:
+                raise self.open_error
+            # winreg's default access includes KEY_QUERY_VALUE. When a caller
+            # supplies an explicit mask, model it faithfully so a write-only
+            # handle cannot accidentally make readback tests pass.
+            return self._Key(self, access or self.KEY_QUERY_VALUE)
+
+        def QueryValueEx(self, key, name):
+            if not key.access & self.KEY_QUERY_VALUE:
+                raise PermissionError(5, "access denied")
+            if self.query_error is not None:
+                raise self.query_error
+            if name not in self.values:
+                raise FileNotFoundError(2, "value not found")
+            return (self.values[name], self.REG_SZ)
+
+        def DeleteValue(self, key, name):
+            self.deleted.append(name)
+            if name not in self.values:
+                raise FileNotFoundError(2, "value not found")
+            del self.values[name]
+
+        def SetValueEx(self, key, name, reserved, kind, value):
+            self.written.append((name, value))
+            self.values[name] = value
+
+        class _Key:
+            def __init__(self, owner, access):
+                self.owner = owner
+                self.access = access
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+    def _autostart_state(self, winreg_stub, expected_command='"D:\\App\\P.exe"'):
+        from pearipherals_support import classify_autostart
+
+        return InputLifecycleTests._load_app_definition("autostart_state", {
+            "winreg": winreg_stub,
+            "RUN_KEY": "Software\\Fake\\Run",
+            "RUN_NAME": "Pearipherals",
+            "classify_autostart": classify_autostart,
+            "autostart_command": lambda: expected_command,
+        })
+
+    def test_missing_run_value_is_the_only_confirmed_off_state(self):
+        winreg_stub = self.FakeWinreg(values={})
+
+        self.assertEqual("off", self._autostart_state(winreg_stub)())
+
+    def test_matching_command_is_current_and_moved_command_is_stale(self):
+        current = self.FakeWinreg(values={"Pearipherals": '"D:\\App\\P.exe"'})
+        moved = self.FakeWinreg(values={"Pearipherals": '"C:\\Old\\P.exe"'})
+
+        self.assertEqual("current", self._autostart_state(current)())
+        self.assertEqual("stale", self._autostart_state(moved)())
+
+    def test_non_absence_read_failures_are_unavailable_never_off(self):
+        failures = (
+            PermissionError(5, "access denied"),
+            OSError(1018, "key marked for deletion"),
+        )
+
+        for error in failures:
+            with self.subTest(error=error):
+                on_open = self.FakeWinreg(open_error=error)
+                on_query = self.FakeWinreg(query_error=error)
+
+                self.assertEqual("unavailable", self._autostart_state(on_open)())
+                self.assertEqual("unavailable", self._autostart_state(on_query)())
+
+    def test_missing_run_key_itself_is_confirmed_off(self):
+        winreg_stub = self.FakeWinreg(
+            open_error=FileNotFoundError(2, "key not found")
+        )
+
+        self.assertEqual("off", self._autostart_state(winreg_stub)())
+
+    def test_boolean_autostart_api_is_preserved_for_existing_callers(self):
+        from pearipherals_support import classify_autostart
+
+        def build(winreg_stub):
+            return InputLifecycleTests._load_app_definition("autostart_get", {
+                "autostart_state": self._autostart_state(winreg_stub),
+                "classify_autostart": classify_autostart,
+            })
+
+        on = self.FakeWinreg(values={"Pearipherals": '"D:\\App\\P.exe"'})
+        stale = self.FakeWinreg(values={"Pearipherals": '"C:\\Old\\P.exe"'})
+        off = self.FakeWinreg(values={})
+        broken = self.FakeWinreg(open_error=PermissionError(5, "denied"))
+
+        self.assertIs(True, build(on)())
+        self.assertIs(True, build(stale)())
+        self.assertIs(False, build(off)())
+        self.assertIs(False, build(broken)())
+
+
+class AutostartRemovalTests(unittest.TestCase):
+    def _autostart_set(self, winreg_stub):
+        return InputLifecycleTests._load_app_definition("autostart_set", {
+            "winreg": winreg_stub,
+            "RUN_KEY": "Software\\Fake\\Run",
+            "RUN_NAME": "Pearipherals",
+            "OLD_RUN_NAMES": ("MagicKeys", "MagicSuite"),
+            "autostart_command": lambda: '"D:\\App\\P.exe"',
+        })
+
+    def test_disabling_removes_current_and_every_legacy_run_value(self):
+        winreg_stub = AutostartProbeTests.FakeWinreg(values={
+            "Pearipherals": '"D:\\App\\P.exe"',
+            "MagicKeys": '"C:\\Old\\MagicKeys.exe"',
+            "MagicSuite": '"C:\\Old\\MagicSuite.exe"',
+            "Unrelated": "keep me",
+        })
+
+        self._autostart_set(winreg_stub)(False)
+
+        self.assertEqual(
+            ["Pearipherals", "MagicKeys", "MagicSuite"], winreg_stub.deleted
+        )
+        self.assertEqual({"Unrelated": "keep me"}, winreg_stub.values)
+
+    def test_already_absent_values_are_not_a_failure(self):
+        winreg_stub = AutostartProbeTests.FakeWinreg(values={})
+
+        self._autostart_set(winreg_stub)(False)
+
+        self.assertEqual(
+            ["Pearipherals", "MagicKeys", "MagicSuite"], winreg_stub.deleted
+        )
+
+    def test_non_absence_delete_failures_propagate_instead_of_being_swallowed(self):
+        class DenyingWinreg(AutostartProbeTests.FakeWinreg):
+            def DeleteValue(self, key, name):
+                self.deleted.append(name)
+                raise PermissionError(5, "access denied")
+
+        winreg_stub = DenyingWinreg(values={"Pearipherals": '"D:\\App\\P.exe"'})
+
+        with self.assertRaises(PermissionError):
+            self._autostart_set(winreg_stub)(False)
+
+    def test_every_name_is_attempted_before_a_failure_is_raised(self):
+        class PartialWinreg(AutostartProbeTests.FakeWinreg):
+            def DeleteValue(self, key, name):
+                self.deleted.append(name)
+                if name == "Pearipherals":
+                    raise PermissionError(5, "access denied")
+                self.values.pop(name, None)
+
+        winreg_stub = PartialWinreg(values={
+            "Pearipherals": '"D:\\App\\P.exe"',
+            "MagicKeys": '"C:\\Old\\MagicKeys.exe"',
+            "MagicSuite": '"C:\\Old\\MagicSuite.exe"',
+        })
+
+        with self.assertRaises(PermissionError):
+            self._autostart_set(winreg_stub)(False)
+
+        self.assertEqual(
+            ["Pearipherals", "MagicKeys", "MagicSuite"], winreg_stub.deleted
+        )
+        self.assertEqual({"Pearipherals": '"D:\\App\\P.exe"'}, winreg_stub.values)
+
+    def test_enabling_still_writes_only_the_current_run_value(self):
+        winreg_stub = AutostartProbeTests.FakeWinreg(values={})
+
+        self._autostart_set(winreg_stub)(True)
+
+        self.assertEqual([("Pearipherals", '"D:\\App\\P.exe"')], winreg_stub.written)
+        self.assertEqual([], winreg_stub.deleted)
+
+
+class RawInputRegistrationStateTests(unittest.TestCase):
+    @staticmethod
+    def _gesture_type(user32_stub):
+        return InputLifecycleTests._load_app_definition(
+            "ThreeFingerDrag",
+            {
+                "ctypes": ctypes,
+                "w": wintypes,
+                "time": time,
+                "threading": threading,
+                "user32": user32_stub,
+                "kernel32": mock.Mock(GetModuleHandleW=lambda name: 1),
+                "suppress_pointer": mock.Mock(),
+                "config_value": lambda key: 0,
+                "actions": mock.Mock(),
+                "SWIPE_ACTIONS": {},
+                "release_custom_input": release_custom_input,
+                "require_single_input": require_single_input,
+                "run_input_callback": run_input_callback,
+                "append_error": lambda message: None,
+                "is_target_trackpad_path": lambda path: True,
+                "contacts_are_stable": lambda *a, **k: False,
+                "expire_stale_contacts": expire_stale_contacts,
+                "should_suppress_pointer": should_suppress_pointer,
+                "INPUT": object,
+                "MOUSEINPUT": object,
+                "MAGIC_EXTRA": 1,
+            },
+        )
+
+    @staticmethod
+    def _blank_gesture(user32_stub=None):
+        gesture_type = RawInputRegistrationStateTests._gesture_type(
+            user32_stub if user32_stub is not None else mock.Mock()
+        )
+        gesture = object.__new__(gesture_type)
+        gesture._raw_input_state = "not started"
+        gesture._raw_input_lock = threading.Lock()
+        gesture._thread = None
+        gesture._wndproc_ref = None
+        return gesture
+
+    def test_state_is_not_started_before_the_listener_thread_runs(self):
+        self.assertEqual("not started", self._blank_gesture().raw_input_state())
+
+    def test_start_reports_starting_until_registration_completes(self):
+        gesture = self._blank_gesture()
+        started = []
+        with mock.patch.object(
+            threading, "Thread",
+            lambda *a, **k: mock.Mock(start=lambda: started.append(True)),
+        ):
+            gesture.start()
+
+        self.assertEqual([True], started)
+        self.assertEqual("starting", gesture.raw_input_state())
+
+    def test_successful_registration_reports_listener_registered(self):
+        gesture = self._blank_gesture()
+        gesture._note_raw_input_state("starting")
+
+        gesture._note_raw_input_state("listener registered")
+
+        self.assertEqual("listener registered", gesture.raw_input_state())
+
+    def test_registration_failure_reports_unavailable(self):
+        gesture = self._blank_gesture()
+        gesture._note_raw_input_state("starting")
+
+        gesture._note_raw_input_state("unavailable")
+
+        self.assertEqual("unavailable", gesture.raw_input_state())
+
+    def test_state_is_rejected_when_it_is_not_a_conservative_enum(self):
+        from pearipherals_support import SUPPORT_ENUMS
+
+        gesture = self._blank_gesture()
+
+        for value in ("listening", "registered", "device present", "ok"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    gesture._note_raw_input_state(value)
+
+        for value in SUPPORT_ENUMS["raw_input_state"]:
+            with self.subTest(value=value):
+                gesture._note_raw_input_state(value)
+                self.assertEqual(value, gesture.raw_input_state())
+
+    def test_registration_state_exposes_no_handle_or_device_path(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        gesture_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ThreeFingerDrag"
+        )
+        probe = next(
+            node for node in gesture_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "raw_input_state"
+        )
+        body = list(probe.body)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)):
+            body = body[1:]          # exclude the docstring, inspect real code
+        returned = " ".join(ast.dump(node) for node in body)
+
+        for leak in ("hwnd", "hDevice", "hdev", "_pp", "_is_tp", "DEVICENAME", "path"):
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, returned)
+
+    def test_run_records_unavailable_when_registration_or_timer_fails(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        self.assertIn('self._note_raw_input_state("unavailable")', source)
+        self.assertIn('self._note_raw_input_state("listener registered")', source)
+        self.assertIn('self._note_raw_input_state("starting")', source)
+
+
+class DriverServiceProbeTests(unittest.TestCase):
+    class RecordingWinreg(AutostartProbeTests.FakeWinreg):
+        """Read-only stand-in that records every access and refuses writes."""
+
+        HKEY_LOCAL_MACHINE = "HKLM"
+        KEY_READ = 0x20019
+
+        def __init__(self, present=True, open_error=None):
+            super().__init__(values={})
+            self.present = present
+            self.open_error = open_error
+            self.opened = []
+
+        def OpenKey(self, root, path, reserved=0, access=0):
+            self.opened.append((root, path, reserved, access))
+            if self.open_error is not None:
+                raise self.open_error
+            if not self.present:
+                raise FileNotFoundError(2, "key not found")
+            return self._Key(self, access or self.KEY_READ)
+
+        def SetValueEx(self, *a, **k):
+            raise AssertionError("driver probe must never write to the registry")
+
+        def DeleteValue(self, *a, **k):
+            raise AssertionError("driver probe must never delete registry values")
+
+        def CreateKey(self, *a, **k):
+            raise AssertionError("driver probe must never create registry keys")
+
+    def _probe(self, winreg_stub):
+        return InputLifecycleTests._load_app_definition("driver_service_state", {
+            "winreg": winreg_stub,
+            "DRIVER_SERVICE_KEY": r"SYSTEM\CurrentControlSet\Services\AmtPtpHidFilter",
+        })
+
+    def test_present_service_key_reports_service_registration_detected(self):
+        winreg_stub = self.RecordingWinreg(present=True)
+
+        self.assertEqual(
+            "service registration detected", self._probe(winreg_stub)()
+        )
+
+    def test_missing_service_key_reports_not_detected(self):
+        winreg_stub = self.RecordingWinreg(present=False)
+
+        self.assertEqual("not detected", self._probe(winreg_stub)())
+
+    def test_probe_reads_the_expected_service_key_read_only(self):
+        winreg_stub = self.RecordingWinreg(present=True)
+
+        self._probe(winreg_stub)()
+
+        self.assertEqual(1, len(winreg_stub.opened))
+        root, path, _reserved, access = winreg_stub.opened[0]
+        self.assertEqual("HKLM", root)
+        self.assertEqual(
+            r"SYSTEM\CurrentControlSet\Services\AmtPtpHidFilter", path
+        )
+        self.assertEqual(winreg_stub.KEY_READ, access)
+        self.assertEqual([], winreg_stub.written)
+        self.assertEqual([], winreg_stub.deleted)
+
+    def test_probe_failure_is_unavailable_and_never_crashes_or_leaks(self):
+        failures = (
+            PermissionError(5, r"access denied reading D:\Portable\driver"),
+            OSError(1018, "key marked for deletion"),
+            RuntimeError(r"unexpected \\?\C:\Users\name failure"),
+        )
+
+        for error in failures:
+            with self.subTest(error=type(error).__name__):
+                winreg_stub = self.RecordingWinreg(open_error=error)
+
+                result = self._probe(winreg_stub)()
+
+                self.assertEqual("unavailable", result)
+                for leak in ("Portable", "Users", "denied", "1018", "\\\\?\\"):
+                    self.assertNotIn(leak, result)
+
+    def test_probe_result_is_always_a_conservative_fixed_enum(self):
+        from pearipherals_support import SUPPORT_ENUMS
+
+        results = {
+            self._probe(self.RecordingWinreg(present=True))(),
+            self._probe(self.RecordingWinreg(present=False))(),
+            self._probe(self.RecordingWinreg(open_error=OSError(5, "x")))(),
+        }
+
+        self.assertEqual(SUPPORT_ENUMS["driver_state"], frozenset(results))
+        self.assertNotIn("installed", " ".join(results))
+
+
+class SupportSnapshotCompositionTests(unittest.TestCase):
+    class CountingBatteryStore:
+        """Cached publisher: snapshot() reads state, it never enumerates HID."""
+
+        def __init__(self, snapshot):
+            self._snapshot = snapshot
+            self.reads = 0
+
+        def snapshot(self):
+            self.reads += 1
+            return self._snapshot
+
+    @staticmethod
+    def _globals(**overrides):
+        from pearipherals_support import (
+            SupportSnapshot,
+            battery_state,
+            classify_removal_readiness,
+        )
+        from pearipherals_version import APP_VERSION, BuildIdentity
+
+        available = BatteryResult("available", 80)
+        store = SupportSnapshotCompositionTests.CountingBatteryStore(
+            BatterySnapshot(available, BatteryResult("not_detected"), 1.0)
+        )
+        app_config = {
+            "three_finger_mode": "swipes",
+            "tp_settings_applied": True,
+            "tp_settings_backup": {},
+        }
+        base = {
+            "SupportSnapshot": SupportSnapshot,
+            "BuildIdentity": BuildIdentity,
+            "APP_VERSION": APP_VERSION,
+            "battery_state": battery_state,
+            "classify_removal_readiness": classify_removal_readiness,
+            "build_identity": lambda: BuildIdentity(APP_VERSION, "git:" + "a" * 40),
+            "UNKNOWN_BUILD_ID": "git:" + "0" * 40,
+            "IS_FROZEN": True,
+            "battery_snapshots": store,
+            "config": app_config,
+            "config_value": lambda key, default=None: app_config.get(key, default),
+            "CONFIG_RECOVERY_ERROR": None,
+            "LIFECYCLE_STATE": "version changed",
+            "windows_release_info": lambda: ("Windows 11", "26100", "AMD64"),
+            "driver_service_state": lambda: "service registration detected",
+            "three_finger_drag": mock.Mock(
+                raw_input_state=lambda: "listener registered"
+            ),
+            "tp_settings": mock.Mock(
+                status_text=lambda: "applied",
+                natural_scroll_get=lambda: False,
+            ),
+            "autostart_state": lambda: "current",
+            "legacy_autostart_state": lambda: "absent",
+        }
+        base.update(overrides)
+        return base, store, app_config
+
+    def _build(self, **overrides):
+        globals_, store, app_config = self._globals(**overrides)
+        globals_["_safe_state"] = InputLifecycleTests._load_app_definition(
+            "_safe_state", {}
+        )
+        builder = InputLifecycleTests._load_app_definition(
+            "build_support_snapshot", globals_
+        )
+        return builder, store, app_config
+
+    def test_snapshot_composes_fixed_states_from_every_probe(self):
+        build, _store, _config = self._build()
+
+        snapshot = build()
+
+        self.assertEqual("frozen", snapshot.mode)
+        self.assertEqual("git:" + "a" * 40, snapshot.identity.build_id)
+        self.assertEqual("Windows 11", snapshot.windows_version)
+        self.assertEqual("loaded", snapshot.config_state)
+        self.assertEqual("available", snapshot.keyboard_battery)
+        self.assertEqual("not detected", snapshot.trackpad_battery)
+        self.assertEqual("service registration detected", snapshot.driver_state)
+        self.assertEqual("listener registered", snapshot.raw_input_state)
+        self.assertEqual("swipes", snapshot.gesture_mode)
+        self.assertEqual("applied", snapshot.touchpad_settings)
+        self.assertEqual("classic", snapshot.scroll_direction)
+        self.assertEqual("current", snapshot.autostart)
+        self.assertEqual("version changed", snapshot.lifecycle)
+        self.assertEqual("action required", snapshot.removal_readiness)
+
+    def test_gesture_readiness_requires_touchpad_ownership_settings_to_be_applied(self):
+        build, _store, _config = self._build(
+            tp_settings=mock.Mock(
+                status_text=lambda: "needs apply", natural_scroll_get=lambda: False
+            )
+        )
+
+        snapshot = build()
+
+        self.assertEqual("listener registered", snapshot.raw_input_state)
+        self.assertEqual("needs apply", snapshot.touchpad_settings)
+        self.assertEqual("action required", snapshot.gesture_readiness)
+
+    def test_snapshot_reads_one_cached_battery_snapshot_without_enumerating(self):
+        build, store, _config = self._build()
+
+        build()
+
+        self.assertEqual(1, store.reads)
+
+    def test_recovery_required_config_is_reported_without_exception_text(self):
+        build, _store, _config = self._build(
+            CONFIG_RECOVERY_ERROR=OSError(r"bad config at D:\Portable\p.json")
+        )
+
+        snapshot = build()
+
+        self.assertEqual("recovery required", snapshot.config_state)
+        self.assertNotIn("Portable", str(snapshot))
+
+    def test_natural_scroll_preference_maps_to_the_scroll_direction_enum(self):
+        build, _store, _config = self._build(
+            tp_settings=mock.Mock(
+                status_text=lambda: "applied", natural_scroll_get=lambda: True
+            )
+        )
+
+        self.assertEqual("natural", build().scroll_direction)
+
+    def test_probe_failures_degrade_to_unavailable_instead_of_crashing(self):
+        def boom():
+            raise OSError(r"denied at \\server\share")
+
+        build, _store, _config = self._build(
+            tp_settings=mock.Mock(status_text=boom, natural_scroll_get=boom),
+            autostart_state=boom,
+            windows_release_info=boom,
+        )
+
+        snapshot = build()
+
+        self.assertEqual("unavailable", snapshot.touchpad_settings)
+        self.assertEqual("unavailable", snapshot.scroll_direction)
+        self.assertEqual("unavailable", snapshot.autostart)
+        self.assertEqual("unavailable", snapshot.windows_version)
+        self.assertNotIn("server", str(snapshot))
+
+    def test_removal_readiness_is_ready_only_when_all_state_is_clear(self):
+        build, _store, app_config = self._build(
+            autostart_state=lambda: "off",
+            tp_settings=mock.Mock(
+                status_text=lambda: "original settings",
+                natural_scroll_get=lambda: False,
+            ),
+        )
+        app_config["three_finger_mode"] = "off"
+        app_config["tp_settings_applied"] = False
+        app_config["tp_settings_backup"] = {}
+        app_config["mac_fkeys"] = False
+
+        self.assertEqual("ready", build().removal_readiness)
+
+    def test_snapshot_building_never_enumerates_hid_devices(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        builder = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "build_support_snapshot"
+        )
+        dumped = ast.dump(builder)
+
+        for forbidden in (
+            "enumerate", "hidapi", "HidBatteryBackend", "start_battery_worker",
+            "poll_once", "request_report",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, dumped)
+
+
+class WindowsReleaseInfoTests(unittest.TestCase):
+    def test_windows_11_uses_build_when_kernel_release_still_says_10(self):
+        fake_platform = mock.Mock(
+            system=lambda: "Windows",
+            release=lambda: "10",
+            version=lambda: "10.0.26200",
+            machine=lambda: "AMD64",
+        )
+        release_info = InputLifecycleTests._load_app_definition(
+            "windows_release_info", {"platform": fake_platform}
+        )
+
+        self.assertEqual(
+            ("Windows 11", "10.0.26200", "AMD64"), release_info()
+        )
+
+
+class AboutDialogTests(unittest.TestCase):
+    @staticmethod
+    def _source():
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            return stream.read()
+
+    def test_message_box_declares_pointer_sized_prototypes(self):
+        source = self._source()
+
+        for declaration in (
+            "user32.MessageBoxW.argtypes = (w.HWND, w.LPCWSTR, w.LPCWSTR, w.UINT)",
+            "user32.MessageBoxW.restype = ctypes.c_int",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertTrue(
+                    declaration in source,
+                    f"missing pointer-sized declaration: {declaration}",
+                )
+
+    def test_about_dialog_is_ownerless_so_hidden_tray_hwnd_cannot_steal_activation(self):
+        calls = []
+        show_about = InputLifecycleTests._load_app_definition("show_about_dialog", {
+            "user32": mock.Mock(MessageBoxW=lambda *a: calls.append(a) or 1),
+            "build_support_snapshot": lambda: "SNAP",
+            "format_about": lambda snapshot: f"about:{snapshot}",
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_OK": 0x0,
+            "MB_ICONINFORMATION": 0x40,
+            "MB_SETFOREGROUND": 0x10000,
+        })
+
+        show_about()
+
+        self.assertEqual(1, len(calls))
+        hwnd, text, title, flags = calls[0]
+        self.assertIsNone(hwnd)
+        self.assertEqual("about:SNAP", text)
+        self.assertEqual("Pearipherals — About / status", title)
+        self.assertEqual(0x0 | 0x40 | 0x10000, flags)
+
+    def test_about_message_box_runs_off_the_pystray_callback_thread(self):
+        caller_thread = threading.get_ident()
+        dialog_threads = []
+        show_about = InputLifecycleTests._load_app_definition("show_about_dialog", {
+            "user32": mock.Mock(
+                MessageBoxW=lambda *args: dialog_threads.append(
+                    threading.get_ident()
+                ) or 1
+            ),
+            "build_support_snapshot": lambda: "SNAP",
+            "format_about": lambda snapshot: f"about:{snapshot}",
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_OK": 0x0,
+            "MB_ICONINFORMATION": 0x40,
+            "MB_SETFOREGROUND": 0x10000,
+        })
+
+        show_about()
+
+        self.assertEqual(1, len(dialog_threads))
+        self.assertNotEqual(caller_thread, dialog_threads[0])
+
+    def test_about_dialog_blocks_reentrant_stack_but_allows_later_open(self):
+        calls = []
+        show_about = None
+
+        def message_box(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                show_about()
+            return 1
+
+        show_about = InputLifecycleTests._load_app_definition("show_about_dialog", {
+            "user32": mock.Mock(MessageBoxW=message_box),
+            "build_support_snapshot": lambda: "SNAP",
+            "format_about": lambda snapshot: f"about:{snapshot}",
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_OK": 0x0,
+            "MB_ICONINFORMATION": 0x40,
+            "MB_SETFOREGROUND": 0x10000,
+        })
+
+        show_about()
+        show_about()
+
+        self.assertEqual(2, len(calls))
+
+    def test_dialog_never_runs_until_the_tray_callback_is_invoked(self):
+        calls = []
+        on_about = InputLifecycleTests._load_app_definition("on_about", {
+            "show_about_dialog": lambda: calls.append("shown"),
+        })
+
+        self.assertEqual([], calls)
+
+        on_about(mock.Mock(), mock.Mock())
+
+        self.assertEqual(["shown"], calls)
+
+    def test_dialog_failure_is_logged_and_never_propagates_to_the_tray(self):
+        logged = []
+        message_box = mock.Mock(side_effect=[OSError("no window station"), 1])
+        show_about = InputLifecycleTests._load_app_definition("show_about_dialog", {
+            "user32": mock.Mock(MessageBoxW=message_box),
+            "build_support_snapshot": lambda: "SNAP",
+            "format_about": lambda snapshot: "about",
+            "append_error": logged.append,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_OK": 0x0,
+            "MB_ICONINFORMATION": 0x40,
+            "MB_SETFOREGROUND": 0x10000,
+        })
+
+        show_about()
+        show_about()
+
+        self.assertEqual(1, len(logged))
+        self.assertIn("About", logged[0])
+        self.assertEqual(2, message_box.call_count)
+
+    def test_about_menu_item_is_registered_and_uses_a_dedicated_callback(self):
+        source = self._source()
+
+        self.assertTrue(
+            'pystray.MenuItem("About / status…", on_about)' in source,
+            "tray menu must expose About / status… wired to on_about",
+        )
+
+    def test_about_dialog_is_not_invoked_from_the_hid_worker(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+
+        worker_names = {
+            "start_battery_worker", "publish_battery_snapshot", "worker",
+            "hook_thread", "battery_menu_label",
+        }
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in worker_names:
+                with self.subTest(function=node.name):
+                    dumped = ast.dump(node)
+                    self.assertNotIn("show_about_dialog", dumped)
+                    self.assertNotIn("MessageBoxW", dumped)
+
+
+class DiagnosticsExportTests(unittest.TestCase):
+    def _export(self, directory, **overrides):
+        from pearipherals_support import DIAGNOSTICS_FILENAME, diagnostics_payload
+
+        globals_ = {
+            "APP_DIR": directory,
+            "DIAGNOSTICS_FILENAME": DIAGNOSTICS_FILENAME,
+            "diagnostics_payload": diagnostics_payload,
+            "save_json_atomic": save_json_atomic,
+            "build_support_snapshot": lambda: self._snapshot(),
+            "append_error": lambda message: None,
+            "_notify": lambda icon, message, title: None,
+            "os": os,
+            "datetime": __import__("datetime"),
+        }
+        globals_.update(overrides)
+        return InputLifecycleTests._load_app_definition(
+            "export_diagnostics", globals_
+        )
+
+    @staticmethod
+    def _snapshot():
+        from pearipherals_support import SupportSnapshot
+        from pearipherals_version import APP_VERSION, BuildIdentity
+
+        return SupportSnapshot(
+            identity=BuildIdentity(APP_VERSION, "git:" + "b" * 40),
+            mode="frozen",
+            windows_version="Windows 11",
+            windows_build="26100",
+            architecture="AMD64",
+            config_state="loaded",
+            keyboard_battery="available",
+            trackpad_battery="not detected",
+            raw_input_state="listener registered",
+            driver_state="service registration detected",
+            gesture_mode="swipes",
+            gesture_readiness="ready",
+            touchpad_settings="applied",
+            scroll_direction="classic",
+            autostart="current",
+            lifecycle="unchanged",
+            removal_readiness="action required",
+        )
+
+    def test_nothing_is_written_until_the_callback_is_invoked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._export(directory)
+
+            self.assertEqual([], os.listdir(directory))
+
+    def test_export_writes_a_parseable_report_beside_the_app(self):
+        from pearipherals_support import DIAGNOSTICS_FILENAME
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._export(directory)(mock.Mock())
+
+            self.assertEqual([DIAGNOSTICS_FILENAME], os.listdir(directory))
+            with open(os.path.join(directory, DIAGNOSTICS_FILENAME),
+                      encoding="utf-8") as stream:
+                payload = json.load(stream)
+            self.assertEqual("Pearipherals", payload["product"]["name"])
+            self.assertEqual("git:" + "b" * 40, payload["product"]["build_id"])
+            self.assertNotIn(directory, json.dumps(payload))
+
+    def test_notification_names_only_the_fixed_filename_never_a_full_path(self):
+        from pearipherals_support import DIAGNOSTICS_FILENAME
+
+        notices = []
+        with tempfile.TemporaryDirectory() as directory:
+            self._export(
+                directory,
+                _notify=lambda icon, message, title: notices.append((message, title)),
+            )(mock.Mock())
+
+        self.assertEqual(1, len(notices))
+        message, _title = notices[0]
+        self.assertIn(DIAGNOSTICS_FILENAME, message)
+        self.assertNotIn(directory, message)
+        self.assertNotIn(":\\", message)
+        self.assertNotIn("/", message.replace("Pearipherals", ""))
+
+    def test_a_failed_write_notifies_honestly_without_leaking_the_path(self):
+        notices = []
+        logged = []
+
+        def boom(path, payload):
+            raise OSError(rf"denied writing {path}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._export(
+                directory,
+                save_json_atomic=boom,
+                _notify=lambda icon, message, title: notices.append((message, title)),
+                append_error=logged.append,
+            )(mock.Mock())
+
+            self.assertEqual([], os.listdir(directory))
+            self.assertEqual(1, len(notices))
+            message, title = notices[0]
+            self.assertNotIn(directory, message)
+            self.assertIn("could not", message.lower())
+            self.assertEqual(1, len(logged))
+
+    def test_export_menu_item_is_registered_with_a_dedicated_callback(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        entry = 'pystray.MenuItem("Save a diagnostic report", on_export_diagnostics)'
+        self.assertTrue(entry in source, f"missing tray entry: {entry}")
+
+
+class RemovalPreparationTests(unittest.TestCase):
+    def _callback(self, **overrides):
+        from pearipherals_support import (
+            format_removal_summary,
+            perform_removal,
+        )
+
+        recorded = overrides.pop("recorded", [])
+        app_config = overrides.pop("app_config", {
+            "mac_fkeys": True, "three_finger_mode": "swipes",
+        })
+        globals_ = {
+            "perform_removal": perform_removal,
+            "format_removal_summary": format_removal_summary,
+            "config": app_config,
+            "CONFIG_LOCK": threading.RLock(),
+            "CONFIG_RECOVERY_ERROR": None,
+            "config_value": lambda key, default=None: app_config.get(key, default),
+            "save_config": lambda cfg: recorded.append("save"),
+            "autostart_set": lambda enable: recorded.append(f"autostart:{enable}"),
+            "tp_settings": mock.Mock(
+                restore=lambda: recorded.append("restore") or {}
+            ),
+            "release_custom_input": lambda abort, disable: (
+                recorded.append("release") or []
+            ),
+            "three_finger_drag": mock.Mock(abort_gesture=lambda: None),
+            "suppress_pointer": mock.Mock(set=lambda active: None),
+            "confirm_removal": lambda: True,
+            "_notify": lambda icon, message, title: recorded.append(("notify", message)),
+            "_update_menu": lambda icon: None,
+            "append_error": lambda message: recorded.append(("error", message)),
+            "os": os,
+        }
+        globals_.update(overrides)
+        callback = InputLifecycleTests._load_app_definition(
+            "on_prepare_removal", globals_
+        )
+        return callback, recorded, app_config
+
+    def test_confirmed_removal_disables_settings_and_restores_state(self):
+        callback, recorded, app_config = self._callback()
+
+        callback(mock.Mock(), mock.Mock())
+
+        self.assertFalse(app_config["mac_fkeys"])
+        self.assertEqual("off", app_config["three_finger_mode"])
+        self.assertIn("autostart:False", recorded)
+        self.assertIn("restore", recorded)
+        self.assertIn("release", recorded)
+
+    def test_cancellation_performs_absolutely_no_mutation(self):
+        callback, recorded, app_config = self._callback(
+            confirm_removal=lambda: False
+        )
+        before = dict(app_config)
+
+        callback(mock.Mock(), mock.Mock())
+
+        self.assertEqual(before, app_config)
+        self.assertEqual([], recorded)
+
+    def test_recovery_required_config_blocks_mutation_and_explains_manually(self):
+        notices = []
+        callback, recorded, app_config = self._callback(
+            CONFIG_RECOVERY_ERROR=OSError(r"bad config at D:\Portable\p.json"),
+            _notify=lambda icon, message, title: notices.append((message, title)),
+        )
+        before = dict(app_config)
+
+        callback(mock.Mock(), mock.Mock())
+
+        self.assertEqual(before, app_config)
+        self.assertNotIn("autostart:False", recorded)
+        self.assertNotIn("restore", recorded)
+        self.assertEqual(1, len(notices))
+        message, _title = notices[0]
+        self.assertNotIn("Portable", message)
+        self.assertIn("Start with Windows", message)
+
+    def test_a_failed_step_never_reports_success_but_still_runs_the_rest(self):
+        notices = []
+
+        def failing_autostart(enable):
+            raise OSError(r"registry denied at HKCU\...\Run")
+
+        callback, recorded, _config = self._callback(
+            autostart_set=failing_autostart,
+            _notify=lambda icon, message, title: notices.append((message, title)),
+        )
+
+        callback(mock.Mock(), mock.Mock())
+
+        self.assertIn("restore", recorded)
+        self.assertEqual(1, len(notices))
+        message, _title = notices[0]
+        self.assertIn("could not be completed", message)
+        self.assertNotIn("denied", message)
+        self.assertNotIn("HKCU", message)
+
+    def test_removal_never_deletes_files_or_stops_the_application(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "on_prepare_removal"
+        )
+        dumped = ast.dump(node)
+
+        for forbidden in (
+            "remove", "unlink", "rmtree", "_exit", "icon.stop", "shutdown_custom_input",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, dumped)
+
+    def test_confirmation_dialog_is_ownerless_defaults_to_no_and_allows_cancel(self):
+        calls = []
+        confirm = InputLifecycleTests._load_app_definition("confirm_removal", {
+            "user32": mock.Mock(MessageBoxW=lambda *a: calls.append(a) or 7),
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_YESNOCANCEL": 0x3,
+            "MB_ICONWARNING": 0x30,
+            "MB_DEFBUTTON2": 0x100,
+            "MB_SETFOREGROUND": 0x10000,
+            "IDYES": 6,
+        })
+
+        self.assertFalse(confirm())
+
+        self.assertEqual(1, len(calls))
+        hwnd, text, _title, flags = calls[0]
+        self.assertIsNone(hwnd)
+        self.assertEqual(0x3 | 0x30 | 0x100 | 0x10000, flags)
+        self.assertIn("Choose No, Cancel, or X to leave everything as it is.", text)
+
+    def test_only_explicit_yes_authorizes_removal(self):
+        for answer, expected in (
+            (6, True),
+            (7, False),
+            (2, False),
+            (0, False),
+            (999, False),
+        ):
+            with self.subTest(answer=answer):
+                confirm = InputLifecycleTests._load_app_definition(
+                    "confirm_removal",
+                    {
+                        "user32": mock.Mock(MessageBoxW=lambda *args, a=answer: a),
+                        "append_error": lambda message: None,
+                        "DIALOG_LOCK": threading.Lock(),
+                        "threading": threading,
+                        "MB_YESNOCANCEL": 0x3,
+                        "MB_ICONWARNING": 0x30,
+                        "MB_DEFBUTTON2": 0x100,
+                        "MB_SETFOREGROUND": 0x10000,
+                        "IDYES": 6,
+                    },
+                )
+
+                self.assertIs(expected, confirm())
+
+    def test_confirmation_message_box_runs_off_the_pystray_callback_thread(self):
+        caller_thread = threading.get_ident()
+        dialog_threads = []
+        confirm = InputLifecycleTests._load_app_definition("confirm_removal", {
+            "user32": mock.Mock(
+                MessageBoxW=lambda *args: dialog_threads.append(
+                    threading.get_ident()
+                ) or 7
+            ),
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_YESNOCANCEL": 0x3,
+            "MB_ICONWARNING": 0x30,
+            "MB_DEFBUTTON2": 0x100,
+            "MB_SETFOREGROUND": 0x10000,
+            "IDYES": 6,
+        })
+
+        self.assertFalse(confirm())
+
+        self.assertEqual(1, len(dialog_threads))
+        self.assertNotEqual(caller_thread, dialog_threads[0])
+
+    def test_confirmation_blocks_reentrant_stack_and_fails_closed(self):
+        calls = []
+        confirm = None
+
+        def message_box(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                self.assertFalse(confirm())
+            return 7
+
+        confirm = InputLifecycleTests._load_app_definition("confirm_removal", {
+            "user32": mock.Mock(MessageBoxW=message_box),
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_YESNOCANCEL": 0x3,
+            "MB_ICONWARNING": 0x30,
+            "MB_DEFBUTTON2": 0x100,
+            "MB_SETFOREGROUND": 0x10000,
+            "IDYES": 6,
+        })
+
+        self.assertFalse(confirm())
+        self.assertFalse(confirm())
+
+        self.assertEqual(2, len(calls))
+
+    def test_confirmation_prototypes_and_flags_are_declared_explicitly(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        for declaration in (
+            "user32.MessageBoxW.argtypes = (w.HWND, w.LPCWSTR, w.LPCWSTR, w.UINT)",
+            "user32.MessageBoxW.restype = ctypes.c_int",
+            "MB_YESNOCANCEL = 0x00000003",
+            "MB_ICONWARNING = 0x00000030",
+            "MB_DEFBUTTON2 = 0x00000100",
+            "MB_SETFOREGROUND = 0x00010000",
+            "IDYES = 6",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertTrue(
+                    declaration in source,
+                    f"missing declaration: {declaration}",
+                )
+
+    def test_a_failed_confirmation_dialog_cancels_instead_of_mutating(self):
+        message_box = mock.Mock(side_effect=[OSError("no window station"), 7])
+        confirm = InputLifecycleTests._load_app_definition("confirm_removal", {
+            "user32": mock.Mock(MessageBoxW=message_box),
+            "append_error": lambda message: None,
+            "DIALOG_LOCK": threading.Lock(),
+            "threading": threading,
+            "MB_YESNOCANCEL": 0x3,
+            "MB_ICONWARNING": 0x30,
+            "MB_DEFBUTTON2": 0x100,
+            "MB_SETFOREGROUND": 0x10000,
+            "IDYES": 6,
+        })
+
+        self.assertFalse(confirm())
+        self.assertFalse(confirm())
+        self.assertEqual(2, message_box.call_count)
+
+    def test_removal_menu_item_is_registered_with_a_dedicated_callback(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        entry = 'pystray.MenuItem("Prepare for removal…", on_prepare_removal)'
+        self.assertTrue(entry in source, f"missing tray entry: {entry}")
+
+
+class BuildIdentityResolutionTests(unittest.TestCase):
+    """A one-file PyInstaller build extracts bundled data to sys._MEIPASS,
+    which is NOT the directory holding the executable. Reading only APP_DIR
+    would silently degrade every frozen build to the unknown build id."""
+
+    def _identity(self, directory, meipass=None):
+        from pearipherals_support import DIAGNOSTICS_FILENAME  # noqa: F401
+        from pearipherals_version import APP_VERSION, BuildIdentity
+
+        fake_sys = mock.Mock(frozen=True)
+        if meipass is None:
+            del fake_sys._MEIPASS
+        else:
+            fake_sys._MEIPASS = meipass
+        return InputLifecycleTests._load_app_definition("build_identity", {
+            "IS_FROZEN": True,
+            "APP_DIR": directory,
+            "BUILD_MANIFEST_NAME": "pearipherals-build.json",
+            "UNKNOWN_BUILD_ID": "git:" + "0" * 40,
+            "APP_VERSION": APP_VERSION,
+            "BuildIdentity": BuildIdentity,
+            "entry_source_build_id": lambda path: "entry-sha256:" + "f" * 64,
+            "json": json,
+            "os": os,
+            "sys": fake_sys,
+        })
+
+    @staticmethod
+    def _write_manifest(directory, build_id, version="1.2.0"):
+        with open(os.path.join(directory, "pearipherals-build.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({"build_id": build_id, "version": version}, stream)
+
+    def test_one_file_build_reads_the_manifest_from_the_extraction_dir(self):
+        with tempfile.TemporaryDirectory() as exe_dir, \
+                tempfile.TemporaryDirectory() as meipass:
+            self._write_manifest(meipass, "git:" + "a" * 40)
+
+            identity = self._identity(exe_dir, meipass=meipass)()
+
+            self.assertEqual("git:" + "a" * 40, identity.build_id)
+
+    def test_frozen_runtime_version_comes_from_the_validated_manifest(self):
+        with tempfile.TemporaryDirectory() as exe_dir, \
+                tempfile.TemporaryDirectory() as meipass:
+            self._write_manifest(meipass, "git:" + "b" * 40, version="9.8.7")
+
+            identity = self._identity(exe_dir, meipass=meipass)()
+
+            self.assertEqual("9.8.7", identity.version)
+            self.assertEqual("git:" + "b" * 40, identity.build_id)
+
+    def test_a_manifest_beside_the_executable_still_works(self):
+        with tempfile.TemporaryDirectory() as exe_dir:
+            self._write_manifest(exe_dir, "git:" + "c" * 40)
+
+            identity = self._identity(exe_dir)()
+
+            self.assertEqual("git:" + "c" * 40, identity.build_id)
+
+    def test_invalid_embedded_manifest_never_falls_back_to_adjacent_manifest(self):
+        with tempfile.TemporaryDirectory() as exe_dir, \
+                tempfile.TemporaryDirectory() as meipass:
+            self._write_manifest(meipass, "not-a-build-id")
+            self._write_manifest(exe_dir, "git:" + "e" * 40)
+
+            identity = self._identity(exe_dir, meipass=meipass)()
+
+            self.assertEqual("git:" + "0" * 40, identity.build_id)
+            self.assertEqual("1.2.0", identity.version)
+
+    def test_present_falsey_meipass_never_reads_adjacent_or_working_directory(self):
+        with tempfile.TemporaryDirectory() as exe_dir, \
+                tempfile.TemporaryDirectory() as working_dir:
+            self._write_manifest(exe_dir, "git:" + "e" * 40)
+            self._write_manifest(working_dir, "git:" + "f" * 40)
+            previous_directory = os.getcwd()
+            try:
+                os.chdir(working_dir)
+                root_relative = os.path.splitdrive(working_dir)[1]
+                for meipass in ("", root_relative):
+                    with self.subTest(meipass=meipass):
+                        identity = self._identity(exe_dir, meipass=meipass)()
+                        self.assertEqual("git:" + "0" * 40, identity.build_id)
+                        self.assertEqual("1.2.0", identity.version)
+            finally:
+                os.chdir(previous_directory)
+
+    def test_a_missing_or_invalid_manifest_degrades_to_the_unknown_identity(self):
+        with tempfile.TemporaryDirectory() as exe_dir:
+            self.assertEqual(
+                "git:" + "0" * 40, self._identity(exe_dir)().build_id
+            )
+
+            self._write_manifest(exe_dir, "not-a-build-id")
+            self.assertEqual(
+                "git:" + "0" * 40, self._identity(exe_dir)().build_id
+            )
+
+    def test_the_manifest_never_reaches_the_surface_as_a_path(self):
+        with tempfile.TemporaryDirectory() as exe_dir, \
+                tempfile.TemporaryDirectory() as meipass:
+            self._write_manifest(meipass, "git:" + "d" * 40)
+
+            identity = self._identity(exe_dir, meipass=meipass)()
+
+            self.assertNotIn(meipass, str(identity))
+            self.assertNotIn(exe_dir, str(identity))
+
+
+class SupportLinkTests(unittest.TestCase):
+    @staticmethod
+    def _constants():
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        constants = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = node.value.value
+        return constants
+
+    def test_support_links_are_fixed_https_project_constants(self):
+        constants = self._constants()
+
+        self.assertEqual(
+            "https://github.com/OnlineFix/Pearipherals#readme",
+            constants["DOCS_URL"],
+        )
+        self.assertEqual(
+            "https://github.com/OnlineFix/Pearipherals/issues/new/choose",
+            constants["REPORT_URL"],
+        )
+        for url in (constants["DOCS_URL"], constants["REPORT_URL"]):
+            with self.subTest(url=url):
+                self.assertTrue(url.startswith("https://"))
+                self.assertNotIn("{", url)
+                self.assertNotIn("%s", url)
+
+    def test_documentation_link_opens_only_when_the_callback_is_invoked(self):
+        opened = []
+        on_docs = InputLifecycleTests._load_app_definition("on_open_docs", {
+            "open_support_link": opened.append,
+            "DOCS_URL": "https://example.invalid/docs",
+        })
+
+        self.assertEqual([], opened)
+
+        on_docs(mock.Mock(), mock.Mock())
+
+        self.assertEqual(["https://example.invalid/docs"], opened)
+
+    def test_report_link_opens_only_when_the_callback_is_invoked(self):
+        opened = []
+        on_report = InputLifecycleTests._load_app_definition("on_report_problem", {
+            "open_support_link": opened.append,
+            "REPORT_URL": "https://example.invalid/issues",
+        })
+
+        self.assertEqual([], opened)
+
+        on_report(mock.Mock(), mock.Mock())
+
+        self.assertEqual(["https://example.invalid/issues"], opened)
+
+    def test_link_opener_rejects_anything_that_is_not_a_fixed_project_url(self):
+        opened = []
+        logged = []
+        open_support_link = InputLifecycleTests._load_app_definition(
+            "open_support_link",
+            {
+                "webbrowser": mock.Mock(open=opened.append),
+                "append_error": logged.append,
+                "DOCS_URL": "https://github.com/OnlineFix/Pearipherals#readme",
+                "REPORT_URL":
+                    "https://github.com/OnlineFix/Pearipherals/issues/new/choose",
+            },
+        )
+
+        for hostile in (
+            "http://github.com/OnlineFix/Pearipherals",
+            "file:///C:/Users/name/secret.txt",
+            "https://evil.invalid/",
+            r"\\server\share\payload.exe",
+        ):
+            with self.subTest(url=hostile):
+                open_support_link(hostile)
+
+        self.assertEqual([], opened)
+
+        open_support_link("https://github.com/OnlineFix/Pearipherals#readme")
+
+        self.assertEqual(
+            ["https://github.com/OnlineFix/Pearipherals#readme"], opened
+        )
+
+    def test_browser_failure_is_logged_without_leaking_local_paths(self):
+        logged = []
+        open_support_link = InputLifecycleTests._load_app_definition(
+            "open_support_link",
+            {
+                "webbrowser": mock.Mock(
+                    open=mock.Mock(
+                        side_effect=OSError(r"no handler at C:\Users\name\browser")
+                    )
+                ),
+                "append_error": logged.append,
+                "DOCS_URL": "https://github.com/OnlineFix/Pearipherals#readme",
+                "REPORT_URL":
+                    "https://github.com/OnlineFix/Pearipherals/issues/new/choose",
+            },
+        )
+
+        open_support_link("https://github.com/OnlineFix/Pearipherals#readme")
+
+        self.assertEqual(1, len(logged))
+        self.assertNotIn("C:\\Users\\name", logged[0])
+
+    def test_no_network_access_happens_at_import_time(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                continue
+            with self.subTest(node=type(node).__name__):
+                dumped = ast.dump(node)
+                for network in ("webbrowser.open", "urlopen", "requests", "socket"):
+                    self.assertNotIn(network, dumped)
+
+    def test_support_link_menu_items_are_registered(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        for entry in (
+            'pystray.MenuItem("Open documentation", on_open_docs)',
+            'pystray.MenuItem("Report a problem", on_report_problem)',
+        ):
+            with self.subTest(entry=entry):
+                self.assertTrue(entry in source, f"missing tray entry: {entry}")
+
+
+class AutostartMigrationTests(unittest.TestCase):
+    """Legacy Run cleanup must never delete before the current value exists."""
+
+    def _startup_migration(self, winreg_stub, command='"D:\\App\\P.exe"'):
+        from pearipherals_support import classify_autostart
+
+        return InputLifecycleTests._load_app_definition(
+            "migrate_legacy_autostart",
+            {
+                "winreg": winreg_stub,
+                "RUN_KEY": "Software\\Fake\\Run",
+                "RUN_NAME": "Pearipherals",
+                "OLD_RUN_NAMES": ("MagicKeys", "MagicSuite"),
+                "classify_autostart": classify_autostart,
+                "autostart_command": lambda: command,
+                "append_error": lambda message: None,
+            },
+        )
+
+    def test_nothing_is_deleted_when_no_legacy_entry_exists(self):
+        stub = AutostartProbeTests.FakeWinreg(values={})
+
+        self._startup_migration(stub)()
+
+        self.assertEqual([], stub.deleted)
+        self.assertEqual([], stub.written)
+
+    def test_current_value_is_written_and_read_back_before_any_deletion(self):
+        stub = AutostartProbeTests.FakeWinreg(
+            values={"MagicSuite": '"D:\\Old\\MagicSuite.exe"'}
+        )
+
+        self._startup_migration(stub)()
+
+        self.assertEqual([("Pearipherals", '"D:\\App\\P.exe"')], stub.written)
+        self.assertEqual(["MagicSuite"], stub.deleted)
+        self.assertNotIn("MagicSuite", stub.values)
+        self.assertEqual('"D:\\App\\P.exe"', stub.values["Pearipherals"])
+
+    def test_a_failed_replacement_leaves_every_legacy_entry_intact(self):
+        legacy = {
+            "MagicKeys": '"D:\\Old\\MagicKeys.exe"',
+            "MagicSuite": '"D:\\Old\\MagicSuite.exe"',
+        }
+
+        class RefusingWrite(AutostartProbeTests.FakeWinreg):
+            def SetValueEx(self, key, name, reserved, kind, value):
+                raise PermissionError(5, "access denied")
+
+        stub = RefusingWrite(values=dict(legacy))
+
+        self._startup_migration(stub)()
+
+        self.assertEqual([], stub.deleted)
+        self.assertEqual(legacy, stub.values)
+
+    def test_an_unverifiable_readback_leaves_every_legacy_entry_intact(self):
+        class LyingReadback(AutostartProbeTests.FakeWinreg):
+            def QueryValueEx(self, key, name):
+                return ('"D:\\Somewhere\\Else.exe"', self.REG_SZ)
+
+        stub = LyingReadback(values={"MagicSuite": '"D:\\Old\\MagicSuite.exe"'})
+
+        self._startup_migration(stub)()
+
+        self.assertEqual([], stub.deleted)
+        self.assertIn("MagicSuite", stub.values)
+
+    def test_partial_cleanup_stays_observable_and_retryable(self):
+        class DenyOneDelete(AutostartProbeTests.FakeWinreg):
+            def DeleteValue(self, key, name):
+                if name == "MagicKeys":
+                    self.deleted.append(name)
+                    raise PermissionError(5, "access denied")
+                return super().DeleteValue(key, name)
+
+        stub = DenyOneDelete(
+            values={
+                "MagicKeys": '"D:\\Old\\MagicKeys.exe"',
+                "MagicSuite": '"D:\\Old\\MagicSuite.exe"',
+            }
+        )
+
+        self._startup_migration(stub)()
+
+        self.assertEqual(["MagicKeys", "MagicSuite"], stub.deleted)
+        self.assertIn("MagicKeys", stub.values)
+        self.assertNotIn("MagicSuite", stub.values)
+
+    def test_startup_calls_migration_before_first_run_setup(self):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+
+        main_body = source.split("def main():", 1)[1]
+        self.assertLess(
+            main_body.index("migrate_legacy_autostart()"),
+            main_body.index("first_run_setup()"),
+        )
+        self.assertNotIn("winreg.DeleteValue(k, old)", source)
+
+
+class AutostartRemovalReadbackTests(unittest.TestCase):
+    def _autostart_set(self, winreg_stub, command='"D:\\App\\P.exe"'):
+        from pearipherals_support import classify_autostart
+
+        return InputLifecycleTests._load_app_definition(
+            "autostart_set",
+            {
+                "winreg": winreg_stub,
+                "RUN_KEY": "Software\\Fake\\Run",
+                "RUN_NAME": "Pearipherals",
+                "OLD_RUN_NAMES": ("MagicKeys", "MagicSuite"),
+                "classify_autostart": classify_autostart,
+                "autostart_command": lambda: command,
+            },
+        )
+
+    def test_disable_verifies_every_name_is_actually_gone(self):
+        stub = AutostartProbeTests.FakeWinreg(
+            values={
+                "Pearipherals": '"D:\\App\\P.exe"',
+                "MagicSuite": '"D:\\Old\\MagicSuite.exe"',
+            }
+        )
+
+        self._autostart_set(stub)(False)
+
+        self.assertEqual({}, stub.values)
+        self.assertEqual(["Pearipherals", "MagicKeys", "MagicSuite"], stub.deleted)
+
+    def test_a_value_that_survives_deletion_is_reported_not_claimed_removed(self):
+        class Undeletable(AutostartProbeTests.FakeWinreg):
+            def DeleteValue(self, key, name):
+                self.deleted.append(name)  # reports success but changes nothing
+
+        stub = Undeletable(values={"Pearipherals": '"D:\\App\\P.exe"'})
+
+        with self.assertRaises(OSError):
+            self._autostart_set(stub)(False)
+
+
+class AdoptedInstallOnboardingTests(unittest.TestCase):
+    def test_adopting_a_legacy_config_does_not_trigger_first_run_mutation(self):
+        from pearipherals_core import load_json_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = os.path.join(directory, "magicsuite.json")
+            with open(legacy_path, "w", encoding="utf-8") as stream:
+                json.dump({"cfg_version": 5, "mac_fkeys": False}, stream)
+
+            saved = {}
+            load_config = InputLifecycleTests._load_app_definition(
+                "load_config",
+                {
+                    "CONFIG_LOCK": threading.RLock(),
+                    "CONFIG_PATH": os.path.join(directory, "pearipherals.json"),
+                    "OLD_CONFIG_PATHS": ((legacy_path, "MagicSuite"),),
+                    "DEFAULTS": {"cfg_version": 6},
+                    "load_json_config": load_json_config,
+                    "ConfigRecoveryRequired": Exception,
+                    "save_config": saved.update,
+                },
+            )
+
+            adopted = load_config()
+
+            self.assertEqual("MagicSuite", adopted["legacy_source"])
+            self.assertTrue(
+                adopted["setup_done"],
+                "an adopted install is already onboarded; first_run_setup must "
+                "not re-apply autostart and touchpad registry changes",
+            )
+
+
+class SnippingKeyboardHookTests(unittest.TestCase):
+    @staticmethod
+    def _load_hook(modifier_down=False, mac_fkeys=True):
+        source_path = os.path.join(os.path.dirname(__file__), "..", "pearipherals.py")
+        with open(source_path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+
+        action_table = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "ACTIONS"
+                    for target in node.targets)
+        )
+        keyboard_struct = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "KBDLLHOOKSTRUCT"
+        )
+        hook = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "ll_hook"
+        )
+
+        control = {
+            "modifier_down": modifier_down,
+            "mac_fkeys": mac_fkeys,
+        }
+
+        class FakeUser32:
+            def __init__(self):
+                self.forwarded = []
+
+            @staticmethod
+            def GetAsyncKeyState(_vk):
+                return 0x8000 if control["modifier_down"] else 0
+
+            def CallNextHookEx(self, *args):
+                self.forwarded.append(args)
+                return 9876
+
+        import queue
+        namespace = {
+            "ctypes": ctypes,
+            "w": wintypes,
+            "ULONG_PTR": ctypes.c_size_t,
+            "HOOKPROC": lambda function: function,
+            "user32": FakeUser32(),
+            "config_value": lambda name: (
+                control["mac_fkeys"] if name == "mac_fkeys" else 10
+            ),
+            "actions": queue.Queue(),
+            "_control": control,
+            "VK_LWIN": 0x5B,
+            "VK_TAB": 0x09,
+            "VK_S": 0x53,
+            "VK_MEDIA_PREV": 0xB1,
+            "VK_MEDIA_PLAY": 0xB3,
+            "VK_MEDIA_NEXT": 0xB0,
+            "VK_VOL_MUTE": 0xAD,
+            "VK_VOL_DOWN": 0xAE,
+            "VK_VOL_UP": 0xAF,
+            "VK_F1": 0x70,
+            "VK_F6": 0x75,
+            "VK_F12": 0x7B,
+            "MOD_VKS": (0x10, 0x11, 0x12, 0x5B, 0x5C),
+            "WM_KEYDOWN": 0x0100,
+            "WM_SYSKEYDOWN": 0x0104,
+            "WM_KEYUP": 0x0101,
+            "WM_SYSKEYUP": 0x0105,
+            "SNIP_KEY_STATE": "up",
+            "LLKHF_INJECTED": 0x10,
+            "MAGIC_EXTRA": 0x50454152,
+        }
+        exec(compile(ast.Module([action_table, keyboard_struct, hook], []),
+                     source_path, "exec"), namespace)
+        return namespace
+
+    @staticmethod
+    def _invoke(namespace, vk, w_param=0x0100, flags=0, extra_info=0):
+        event = namespace["KBDLLHOOKSTRUCT"]()
+        event.vkCode = vk
+        event.flags = flags
+        event.dwExtraInfo = extra_info
+        return namespace["ll_hook"](
+            0, w_param, ctypes.addressof(event)
+        )
+
+    def test_unmodified_f6_enqueues_snipping_overlay_and_is_swallowed(self):
+        namespace = self._load_hook()
+
+        result = self._invoke(namespace, 0x75)
+
+        self.assertEqual(1, result)
+        self.assertEqual(("snip", None), namespace["actions"].get_nowait())
+        self.assertEqual([], namespace["user32"].forwarded)
+
+    def test_modifier_f6_remains_passthrough(self):
+        namespace = self._load_hook(modifier_down=True)
+
+        result = self._invoke(namespace, 0x75)
+
+        self.assertEqual(9876, result)
+        self.assertTrue(namespace["actions"].empty())
+        self.assertEqual(1, len(namespace["user32"].forwarded))
+
+    def test_modifier_f6_press_stays_passthrough_after_modifier_release(self):
+        namespace = self._load_hook(modifier_down=True)
+
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0100))
+        namespace["_control"]["modifier_down"] = False
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0100))
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0101))
+
+        self.assertTrue(namespace["actions"].empty())
+        self.assertEqual(3, len(namespace["user32"].forwarded))
+
+    def test_keyup_resets_captured_press_even_while_frow_is_disabled(self):
+        namespace = self._load_hook()
+
+        self.assertEqual(1, self._invoke(namespace, 0x75, 0x0100))
+        namespace["_control"]["mac_fkeys"] = False
+        self.assertEqual(1, self._invoke(namespace, 0x75, 0x0101))
+        namespace["_control"]["mac_fkeys"] = True
+        self.assertEqual(1, self._invoke(namespace, 0x75, 0x0100))
+
+        self.assertEqual(
+            [("snip", None), ("snip", None)],
+            [namespace["actions"].get_nowait(), namespace["actions"].get_nowait()],
+        )
+        self.assertTrue(namespace["actions"].empty())
+
+    def test_injected_f6_never_changes_physical_press_state(self):
+        namespace = self._load_hook()
+
+        self.assertEqual(
+            9876,
+            self._invoke(namespace, 0x75, 0x0100, flags=0x10),
+        )
+        self.assertEqual(1, self._invoke(namespace, 0x75, 0x0100))
+
+        self.assertEqual(("snip", None), namespace["actions"].get_nowait())
+        self.assertTrue(namespace["actions"].empty())
+
+    def test_app_tagged_f6_never_changes_physical_press_state(self):
+        namespace = self._load_hook()
+
+        self.assertEqual(
+            9876,
+            self._invoke(
+                namespace,
+                0x75,
+                0x0100,
+                extra_info=namespace["MAGIC_EXTRA"],
+            ),
+        )
+        self.assertEqual(1, self._invoke(namespace, 0x75, 0x0100))
+
+        self.assertEqual(("snip", None), namespace["actions"].get_nowait())
+        self.assertTrue(namespace["actions"].empty())
+
+    def test_frow_off_passes_the_complete_f6_press_through(self):
+        namespace = self._load_hook(mac_fkeys=False)
+
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0100))
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0100))
+        self.assertEqual(9876, self._invoke(namespace, 0x75, 0x0101))
+
+        self.assertTrue(namespace["actions"].empty())
+        self.assertEqual(3, len(namespace["user32"].forwarded))
+
+    def test_f6_typematic_repeat_is_suppressed_until_keyup(self):
+        namespace = self._load_hook()
+
+        self._invoke(namespace, 0x75, 0x0100)
+        self._invoke(namespace, 0x75, 0x0100)
+        self._invoke(namespace, 0x75, 0x0101)
+        self._invoke(namespace, 0x75, 0x0100)
+
+        self.assertEqual(
+            [("snip", None), ("snip", None)],
+            [namespace["actions"].get_nowait(), namespace["actions"].get_nowait()],
+        )
+        self.assertTrue(namespace["actions"].empty())
 
 
 if __name__ == "__main__":

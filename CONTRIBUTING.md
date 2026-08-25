@@ -29,7 +29,7 @@ Run the complete source gate from the repository root:
 
 ```bat
 .venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
-.venv\Scripts\python.exe -m py_compile pearipherals.py pearipherals_core.py scripts\write_version_info.py tests\test_core.py tests\test_release.py
+.venv\Scripts\python.exe -m py_compile pearipherals.py pearipherals_core.py pearipherals_snipping.py pearipherals_support.py pearipherals_version.py scripts\write_build_manifest.py scripts\write_version_info.py tests\test_core.py tests\test_release.py tests\test_snipping.py tests\test_support.py
 ```
 
 Also run `git diff --check`. Workflow changes must use immutable full-length action SHAs, least-privilege permissions and non-persisted checkout credentials.

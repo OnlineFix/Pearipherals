@@ -13,7 +13,7 @@ F2  brightness+
 F3  Task View    (Win+Tab)   — Mission Control equivalent
 F4  Search      (Win+S)      — Spotlight equivalent
 F5  F5 (passthrough)
-F6  F6 (passthrough)
+F6  Windows Snipping Tool selection overlay
 F7  previous track
 F8  play/pause
 F9  next track
@@ -29,12 +29,15 @@ Config: pearipherals.json next to this script.
 """
 import ctypes
 import ctypes.wintypes as w
+import datetime
 import json
 import os
+import platform
 import queue
 import sys
 import threading
 import time
+import webbrowser
 
 import pystray
 from PIL import Image, ImageDraw
@@ -63,6 +66,25 @@ from pearipherals_core import (
     should_suppress_pointer,
     shutdown_custom_input,
 )
+from pearipherals_snipping import open_snipping_overlay
+from pearipherals_support import (
+    DIAGNOSTICS_FILENAME,
+    SUPPORT_ENUMS,
+    SupportSnapshot,
+    battery_state,
+    classify_autostart,
+    classify_removal_readiness,
+    diagnostics_payload,
+    format_about,
+    format_removal_summary,
+    observe_version,
+    perform_removal,
+)
+from pearipherals_version import (
+    APP_VERSION,
+    BuildIdentity,
+    entry_source_build_id,
+)
 
 IS_FROZEN = getattr(sys, "frozen", False)
 if IS_FROZEN:
@@ -71,11 +93,21 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "pearipherals.json")
 ERROR_LOG_PATH = os.path.join(APP_DIR, "pearipherals.err.log")
-OLD_CONFIG_PATHS = (os.path.join(APP_DIR, "magicsuite.json"),
-                    os.path.join(APP_DIR, "magickeys.json"))
+OLD_CONFIG_PATHS = (
+    (os.path.join(APP_DIR, "magicsuite.json"), "MagicSuite"),
+    (os.path.join(APP_DIR, "magickeys.json"), "MagicKeys"),
+)
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "Pearipherals"
 OLD_RUN_NAMES = ("MagicKeys", "MagicSuite")
+# Frozen builds ship this deterministic manifest beside the executable.
+BUILD_MANIFEST_NAME = "pearipherals-build.json"
+# Used only when the exact identity cannot be determined; never a real digest.
+UNKNOWN_BUILD_ID = "git:" + "0" * 40
+# Fixed project links. Opening them requires an explicit user click; nothing
+# here performs any network access on its own.
+DOCS_URL = "https://github.com/OnlineFix/Pearipherals#readme"
+REPORT_URL = "https://github.com/OnlineFix/Pearipherals/issues/new/choose"
 MAGIC_EXTRA = 0xA99C0DE  # tag for our own injected events
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -96,6 +128,24 @@ user32.CreateWindowExW.argtypes = (
 user32.CreateWindowExW.restype = w.HWND
 user32.PostMessageW.argtypes = (w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 user32.PostMessageW.restype = w.BOOL
+# Native dialogs are shown only from explicit tray callbacks. They are
+# deliberately ownerless because pystray's two top-level HWNDs are invisible;
+# using either as an owner prevents the visible MessageBox from activating.
+# MessageBoxW still takes a pointer-sized optional HWND and returns int.
+user32.MessageBoxW.argtypes = (w.HWND, w.LPCWSTR, w.LPCWSTR, w.UINT)
+user32.MessageBoxW.restype = ctypes.c_int
+MB_OK = 0x00000000
+MB_ICONINFORMATION = 0x00000040
+# Ownerless dialogs explicitly request foreground activation after the user
+# selects the tray command.
+MB_SETFOREGROUND = 0x00010000
+# Destructive confirmation: warning icon, Yes/No/Cancel, and No pre-selected.
+# Unlike MB_YESNO, the Cancel result also lets the title-bar X close safely.
+MB_YESNOCANCEL = 0x00000003
+MB_ICONWARNING = 0x00000030
+MB_DEFBUTTON2 = 0x00000100
+IDYES = 6
+DIALOG_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------- config
 DEFAULTS = {"mac_fkeys": True, "brightness_step": 10,
@@ -104,7 +154,10 @@ DEFAULTS = {"mac_fkeys": True, "brightness_step": 10,
             "swipe_units": 300,
             "natural_scroll": False,   # False = swipe down scrolls down (wheel style)
             "tp_settings_applied": False,
-            "cfg_version": 5}
+            "current_version": None,
+            "previous_version": None,
+            "legacy_source": None,
+            "cfg_version": 6}
 
 CONFIG_RECOVERY_ERROR = None
 _ERROR_LOG_LOCK = threading.Lock()
@@ -131,15 +184,32 @@ def load_config():
     # settings carry over from the pre-rename names (MagicSuite / MagicKeys)
     with CONFIG_LOCK:
         cfg, state = load_json_config(CONFIG_PATH, DEFAULTS)
+        version = cfg.get("cfg_version", 1)
+        if type(version) is not int or not 1 <= version <= 6:
+            raise ConfigRecoveryRequired(
+                CONFIG_PATH, ValueError("unsupported config schema version")
+            )
         if state == "missing":
-            for path in OLD_CONFIG_PATHS:
-                try:
-                    candidate, old_state = load_json_config(path, DEFAULTS)
-                except ConfigRecoveryRequired:
-                    continue
+            for path, source_label in OLD_CONFIG_PATHS:
+                candidate, old_state = load_json_config(path, DEFAULTS)
                 if old_state == "loaded":
+                    candidate_version = candidate.get("cfg_version", 1)
+                    if (type(candidate_version) is not int
+                            or not 1 <= candidate_version <= 6):
+                        raise ConfigRecoveryRequired(
+                            path, ValueError("unsupported config schema version")
+                        )
+                    candidate["legacy_source"] = source_label
+                    # An adopted install already ran its first-run setup under
+                    # the old name. Marking it onboarded stops first_run_setup
+                    # from re-enabling autostart and rewriting touchpad
+                    # registry values behind the user's back, unless the legacy
+                    # config explicitly says setup never completed.
+                    candidate["setup_done"] = bool(
+                        candidate.get("setup_done", True)
+                    )
+                    save_config(candidate)  # atomically adopt before announcing it
                     cfg = candidate
-                    save_config(cfg)  # adopt a valid old file under the new name
                     break
         # v3: three_finger_drag bool replaced by three_finger_mode enum, and
         # swipe synthesis introduced (old driver can't feed native swipes).
@@ -155,6 +225,13 @@ def load_config():
         if cfg.get("cfg_version", 1) < 5:
             cfg["tp_settings_applied"] = bool(cfg.get("tp_settings_backup"))
             cfg["cfg_version"] = 5
+            save_config(cfg)
+        # v6 records only product lifecycle labels; no local source paths.
+        if cfg.get("cfg_version", 1) < 6:
+            cfg.setdefault("current_version", None)
+            cfg.setdefault("previous_version", None)
+            cfg.setdefault("legacy_source", None)
+            cfg["cfg_version"] = 6
             save_config(cfg)
         return cfg
 
@@ -176,6 +253,13 @@ except ConfigRecoveryRequired as exc:
         "tp_settings_applied": False,
     }
     append_error(f"Config recovery required: {exc}")
+
+LIFECYCLE_STATE = "not recorded"
+if CONFIG_RECOVERY_ERROR is None:
+    try:
+        LIFECYCLE_STATE = observe_version(config, APP_VERSION, lambda: save_config(config))
+    except Exception as exc:
+        append_error(f"Version observation could not be persisted: {exc}")
 
 # ---------------------------------------------------------------- SendInput
 ULONG_PTR = ctypes.c_size_t
@@ -574,6 +658,8 @@ def worker():
                 send_keys(*arg)
             elif kind == "restore_all":
                 restore_all_windows()
+            elif kind == "snip":
+                open_snipping_overlay()
             elif kind == "bright":
                 pct = brightness.step(arg)
                 if pct is not None:
@@ -581,9 +667,15 @@ def worker():
                     if tray_icon is not None:
                         tray_icon.title = (f"Moodio — brightness {pct}% "
                                            f"({brightness.last_backend})")
-        except Exception:
-            pass
-        # coalesce queued repeats of the same action (key held down)
+        except Exception as exc:
+            if kind == "snip":
+                append_error(f"Snipping overlay launch failed: {exc}")
+                _notify(
+                    tray_icon,
+                    "Windows' snipping overlay could not be opened.",
+                    "Snipping Tool failed",
+                )
+        # Coalesce queued repeats of the same action when a key is held down.
         try:
             while True:
                 nxt = actions.get_nowait()
@@ -600,7 +692,9 @@ WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
 WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
 LLKHF_INJECTED = 0x10
 VK_F1, VK_F12 = 0x70, 0x7B
+VK_F6 = 0x75
 MOD_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)  # shift, ctrl, alt, lwin, rwin
+SNIP_KEY_STATE = "up"
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -626,6 +720,7 @@ ACTIONS = {
     0x71: ("bright", None),            # F2
     0x72: ("keys", ([VK_LWIN, VK_TAB],)),   # F3  Task View
     0x73: ("keys", ([VK_LWIN, VK_S],)),     # F4  Search
+    0x75: ("snip", None),                  # F6  Windows snipping overlay
     0x76: ("keys", ([VK_MEDIA_PREV],)),     # F7
     0x77: ("keys", ([VK_MEDIA_PLAY],)),     # F8
     0x78: ("keys", ([VK_MEDIA_NEXT],)),     # F9
@@ -637,22 +732,54 @@ ACTIONS = {
 
 @HOOKPROC
 def ll_hook(nCode, wParam, lParam):
-    if nCode == 0 and config_value("mac_fkeys"):
+    global SNIP_KEY_STATE
+    if nCode == 0:
         kb = ctypes.cast(ctypes.c_void_p(lParam), ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         vk = kb.vkCode
-        if VK_F1 <= vk <= VK_F12 and vk in ACTIONS \
-           and not (kb.flags & LLKHF_INJECTED) and kb.dwExtraInfo != MAGIC_EXTRA:
-            if any(user32.GetAsyncKeyState(m) & 0x8000 for m in MOD_VKS):
+        physical = (
+            not (kb.flags & LLKHF_INJECTED)
+            and kb.dwExtraInfo != MAGIC_EXTRA
+        )
+
+        # F6 has per-press ownership. Once a physical press begins as either the
+        # snipping overlay or passthrough, modifier/config changes cannot switch it
+        # mid-press. Key-up is handled even while the F-row is disabled.
+        if vk == VK_F6 and physical:
+            if wParam in (WM_KEYUP, WM_SYSKEYUP):
+                previous = SNIP_KEY_STATE
+                SNIP_KEY_STATE = "up"
+                if previous == "captured":
+                    return 1
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                kind, arg = ACTIONS[vk]
-                if kind == "bright":
-                    step = config_value("brightness_step")
-                    delta = -step if vk == 0x70 else step
-                    actions.put(("bright", delta))
-                else:
-                    actions.put((kind, arg))
-            return 1  # swallow both keydown and keyup
+                if SNIP_KEY_STATE == "captured":
+                    return 1
+                if SNIP_KEY_STATE == "passthrough":
+                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                if (
+                    not config_value("mac_fkeys")
+                    or any(user32.GetAsyncKeyState(m) & 0x8000 for m in MOD_VKS)
+                ):
+                    SNIP_KEY_STATE = "passthrough"
+                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                SNIP_KEY_STATE = "captured"
+                actions.put(("snip", None))
+                return 1
+
+        if config_value("mac_fkeys"):
+            if VK_F1 <= vk <= VK_F12 and vk in ACTIONS and physical:
+                if any(user32.GetAsyncKeyState(m) & 0x8000 for m in MOD_VKS):
+                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    kind, arg = ACTIONS[vk]
+                    if kind == "bright":
+                        step = config_value("brightness_step")
+                        delta = -step if vk == 0x70 else step
+                        actions.put(("bright", delta))
+                    else:
+                        actions.put((kind, arg))
+                return 1  # swallow both keydown and keyup
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
 
@@ -1109,6 +1236,27 @@ class ThreeFingerDrag:
         self._all_up_since = None
         self._wndproc_ref = None
         self._thread = None
+        # Conservative registration observability. This records only what this
+        # process did (registered a listener or failed to), never whether a
+        # target device exists, is awake, or is bound to anything.
+        self._raw_input_state = "not started"
+        self._raw_input_lock = threading.Lock()
+
+    # Single source of truth: the support model owns the allowed wording, so a
+    # new state can never be accepted here and rejected by SupportSnapshot.
+    RAW_INPUT_STATES = tuple(sorted(SUPPORT_ENUMS["raw_input_state"]))
+
+    def _note_raw_input_state(self, state):
+        """Record one fixed registration state; reject over-claiming wording."""
+        if state not in self.RAW_INPUT_STATES:
+            raise ValueError(f"unsupported raw input registration state: {state}")
+        with self._raw_input_lock:
+            self._raw_input_state = state
+
+    def raw_input_state(self):
+        """Return the fixed registration state; never a handle or device path."""
+        with self._raw_input_lock:
+            return self._raw_input_state
 
     # ---------------- device/report helpers ----------------
     def _device_ok(self, hdev):
@@ -1484,15 +1632,21 @@ class ThreeFingerDrag:
         )
         if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1,
                                               ctypes.sizeof(self.RAWINPUTDEVICE)):
+            # Registration failed. Input behavior is unchanged (fail open); only
+            # the observable state records that no listener could be registered.
+            self._note_raw_input_state("unavailable")
             return  # no PTP device / registration failed — feature disabled
         if not user32.SetTimer(hwnd, self.TIMER_ID, 10, None):
+            self._note_raw_input_state("unavailable")
             return
+        self._note_raw_input_state("listener registered")
         msg = w.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def start(self):
+        self._note_raw_input_state("starting")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1578,30 +1732,176 @@ tp_settings = TouchpadSettings()
 # ---------------------------------------------------------------- autostart
 import winreg
 
+# Read-only observation of the AmtPtpHidFilter service registration. The
+# presence of this key means Windows has a service registered under that name.
+# It does NOT mean the driver is installed correctly, loaded, running, healthy,
+# or bound to any device, and the probe never says otherwise.
+DRIVER_SERVICE_KEY = r"SYSTEM\CurrentControlSet\Services\AmtPtpHidFilter"
+
+
+def driver_service_state():
+    """Return only `service registration detected`/`not detected`/`unavailable`.
+
+    The probe is read-only and total: any failure — including an unexpected
+    non-OSError — is reported as uncertainty, and no exception text, error
+    code, or registry path ever reaches the caller.
+    """
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, DRIVER_SERVICE_KEY, 0, winreg.KEY_READ
+        ):
+            return "service registration detected"
+    except FileNotFoundError:
+        return "not detected"
+    except Exception:
+        return "unavailable"
+
+
+def autostart_command():
+    """Return the exact command this installation should register."""
+    if IS_FROZEN:
+        return f'"{os.path.abspath(sys.executable)}"'
+    pyw = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
+    return f'"{pyw}" "{os.path.abspath(__file__)}"'
+
+
+def autostart_state():
+    """Classify the Run value without ever guessing absence.
+
+    Only a confirmed FileNotFoundError (missing key or missing value) means
+    "off". Every other read failure is uncertainty, reported as "unavailable"
+    so the status surface never claims autostart is disabled when it simply
+    could not be read.
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            command = winreg.QueryValueEx(key, RUN_NAME)[0]
+    except FileNotFoundError:
+        return "off"
+    except OSError:
+        return "unavailable"
+    return classify_autostart(command, autostart_command())
+
 
 def autostart_get():
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, RUN_NAME)
-        return True
-    except OSError:
-        return False
+    """Preserved boolean API: True only when a Run value is actually present."""
+    return autostart_state() in ("current", "stale")
 
 
 def autostart_set(enable):
-    if IS_FROZEN:
-        cmd = f'"{os.path.abspath(sys.executable)}"'
-    else:
-        pyw = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
-        cmd = f'"{pyw}" "{os.path.abspath(__file__)}"'
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    cmd = autostart_command()
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        RUN_KEY,
+        0,
+        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+    ) as k:
         if enable:
             winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, cmd)
-        else:
+            return
+        # Disabling must clear every name this app has ever registered under.
+        # Only confirmed absence is success; any other failure is reported so a
+        # caller can never treat a partial removal as complete. Each name is
+        # still attempted, so one denial cannot hide the remaining entries.
+        failure = None
+        for name in (RUN_NAME, *OLD_RUN_NAMES):
             try:
-                winreg.DeleteValue(k, RUN_NAME)
-            except OSError:
-                pass
+                winreg.DeleteValue(k, name)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if failure is None:
+                    failure = exc
+        # Deleting without reading back would let a silently-ignored delete be
+        # reported to the user as "removed and verified". Confirm absence.
+        for name in (RUN_NAME, *OLD_RUN_NAMES):
+            try:
+                winreg.QueryValueEx(k, name)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if failure is None:
+                    failure = exc
+                continue
+            if failure is None:
+                failure = OSError(
+                    f"start-with-Windows entry still present after deletion: {name}"
+                )
+        if failure is not None:
+            raise failure
+
+
+def legacy_autostart_state():
+    """Report whether ANY legacy Run value is still registered.
+
+    "absent" only when every legacy name is confirmed missing. A read failure
+    is "unavailable" so removal readiness can never claim a clean machine it
+    could not actually verify. No command string is ever returned.
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            for name in OLD_RUN_NAMES:
+                try:
+                    winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return "unavailable"
+                return "present"
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unavailable"
+    return "absent"
+
+
+def migrate_legacy_autostart():
+    """Replace legacy Run entries with the current one, never delete-first.
+
+    The current command is written and read back before a single legacy value
+    is removed, so a failed or unverifiable write leaves every legacy entry
+    intact and the machine still starts the app. Each legacy name is attempted
+    independently, so one denial cannot hide the rest; partial cleanup stays
+    observable through About / status and is retried on the next launch.
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
+            present = []
+            for name in OLD_RUN_NAMES:
+                try:
+                    winreg.QueryValueEx(k, name)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return
+                present.append(name)
+            if not present:
+                return
+            cmd = autostart_command()
+            try:
+                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, cmd)
+                registered = winreg.QueryValueEx(k, RUN_NAME)[0]
+            except OSError as exc:
+                append_error(f"Legacy autostart replacement could not be written: {exc}")
+                return
+            if classify_autostart(registered, cmd) != "current":
+                append_error(
+                    "Legacy autostart replacement could not be verified; "
+                    "legacy entries were left in place."
+                )
+                return
+            for name in present:
+                try:
+                    winreg.DeleteValue(k, name)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    append_error(f"Legacy autostart entry could not be removed: {exc}")
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 # ---------------------------------------------------------------- tray
@@ -1734,6 +2034,346 @@ def stop_battery_worker(timeout=2.0):
         return False
     battery_thread = None
     return True
+
+
+def windows_release_info():
+    """Return safe (version, build, architecture) strings for the About view.
+
+    Windows 11 intentionally retains the NT 10.0 kernel version, and Python's
+    ``platform.release()`` can therefore return ``"10"``. Build 22000 is the
+    documented Windows 11 boundary; use it only to correct that marketing
+    label, while preserving the complete build string for diagnostics.
+    """
+    system = platform.system()
+    release = platform.release()
+    version = platform.version()
+    label = f"{system} {release}".strip()
+    if system == "Windows" and release == "10":
+        try:
+            if int(version.split(".")[2]) >= 22000:
+                label = "Windows 11"
+        except (IndexError, ValueError):
+            pass
+    return label, version, platform.machine()
+
+
+def build_identity():
+    """Return the exact identity of this running build.
+
+    Frozen builds carry a `git:<revision>` manifest produced at packaging time.
+    A one-file build extracts bundled data to `sys._MEIPASS`, which is NOT the
+    directory holding the executable. When `_MEIPASS` exists it is authoritative:
+    a missing or invalid embedded manifest fails closed to unknown and never
+    falls back to an externally writable file beside the executable. `APP_DIR`
+    is used only by frozen one-folder layouts that have no `_MEIPASS`.
+
+    Source mode falls back to an ENTRY-SCRIPT identity, which measures only this
+    file and is explicitly not a complete source-build identity. Any failure
+    degrades to the fixed unknown identity: no path or error text is surfaced.
+    """
+    if IS_FROZEN:
+        try:
+            if hasattr(sys, "_MEIPASS"):
+                directory = os.fspath(sys._MEIPASS)
+                if (
+                    not directory
+                    or not os.path.isabs(directory)
+                    or (os.name == "nt" and not os.path.splitdrive(directory)[0])
+                ):
+                    raise ValueError("invalid embedded manifest directory")
+            else:
+                directory = APP_DIR
+            with open(os.path.join(directory, BUILD_MANIFEST_NAME), "r",
+                      encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            return BuildIdentity(manifest["version"], manifest["build_id"])
+        except Exception:
+            return BuildIdentity(APP_VERSION, UNKNOWN_BUILD_ID)
+    try:
+        return BuildIdentity(APP_VERSION, entry_source_build_id(os.path.abspath(__file__)))
+    except Exception:
+        return BuildIdentity(APP_VERSION, UNKNOWN_BUILD_ID)
+
+
+def _safe_state(read, fallback="unavailable"):
+    """Return a probe's value, or a fixed fallback. Never leaks failure text."""
+    try:
+        return read()
+    except Exception:
+        return fallback
+
+
+def build_support_snapshot():
+    """Compose the About/diagnostics snapshot from cached, conservative state.
+
+    Reads exactly one already-published battery snapshot; menu rendering must
+    never trigger HID enumeration. Every probe degrades to a fixed enum value,
+    so no exception text, path, or device identifier can reach the surface.
+    """
+    version, build, architecture = _safe_state(
+        windows_release_info, ("unavailable", "unavailable", "unavailable")
+    )
+    battery = battery_snapshots.snapshot()
+    gesture_mode = _safe_state(
+        lambda: config_value("three_finger_mode", "off"), "off"
+    )
+    touchpad_settings = _safe_state(tp_settings.status_text)
+    scroll_direction = _safe_state(
+        lambda: "natural" if tp_settings.natural_scroll_get() else "classic"
+    )
+    autostart = _safe_state(autostart_state)
+    legacy_autostart = _safe_state(legacy_autostart_state, "unavailable")
+    raw_input = _safe_state(three_finger_drag.raw_input_state, "unavailable")
+    if gesture_mode == "off":
+        gesture_readiness = "off"
+    elif touchpad_settings in (
+        "needs apply", "original settings", "restore incomplete"
+    ):
+        gesture_readiness = "action required"
+    elif touchpad_settings != "applied":
+        gesture_readiness = "unavailable"
+    elif raw_input == "listener registered":
+        gesture_readiness = "ready"
+    elif raw_input in ("not started", "starting"):
+        gesture_readiness = raw_input
+    else:
+        gesture_readiness = "unavailable"
+    settings_applied = _safe_state(
+        lambda: bool(config_value("tp_settings_applied", False)), True
+    )
+    mac_fkeys = _safe_state(lambda: bool(config_value("mac_fkeys", True)), True)
+    backup_entries = _safe_state(
+        lambda: dict(config_value("tp_settings_backup") or {}), {"unknown": 1}
+    )
+    return SupportSnapshot(
+        identity=_safe_state(
+            build_identity, BuildIdentity(APP_VERSION, UNKNOWN_BUILD_ID)
+        ),
+        mode="frozen" if IS_FROZEN else "source",
+        windows_version=version,
+        windows_build=build,
+        architecture=architecture,
+        config_state="loaded" if CONFIG_RECOVERY_ERROR is None else "recovery required",
+        keyboard_battery=battery_state(battery.keyboard),
+        trackpad_battery=battery_state(battery.trackpad),
+        raw_input_state=raw_input,
+        driver_state=_safe_state(driver_service_state),
+        gesture_mode=gesture_mode,
+        gesture_readiness=gesture_readiness,
+        touchpad_settings=touchpad_settings,
+        scroll_direction=scroll_direction,
+        autostart=autostart,
+        lifecycle=LIFECYCLE_STATE,
+        removal_readiness=classify_removal_readiness(
+            autostart, legacy_autostart, mac_fkeys, gesture_mode,
+            settings_applied, backup_entries
+        ),
+    )
+
+
+def show_about_dialog():
+    """Show one serialized, ownerless About/status dialog.
+
+    Called only from an explicit tray callback. MessageBoxW runs on a temporary
+    clean thread so pystray's hidden GUI windows cannot retain activation or
+    focus. Any failure is logged rather than raised so a missing window station
+    can never take the tray down.
+    """
+    if not DIALOG_LOCK.acquire(blocking=False):
+        return
+    outcome = {}
+    finished = threading.Event()
+
+    def dialog_worker():
+        try:
+            outcome["answer"] = user32.MessageBoxW(
+                None,
+                format_about(build_support_snapshot()),
+                "Pearipherals — About / status",
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    try:
+        worker = threading.Thread(
+            target=dialog_worker, name="PearipheralsDialog", daemon=True
+        )
+        worker.start()
+        finished.wait()
+        worker.join()
+        if "error" in outcome:
+            raise outcome["error"]
+    except Exception as exc:
+        append_error(f"About / status dialog failed: {exc}")
+    finally:
+        DIALOG_LOCK.release()
+
+
+def on_about(icon, item):
+    """Explicit tray action; nothing is shown until the user clicks it."""
+    show_about_dialog()
+
+
+def open_support_link(url):
+    """Open one of the fixed project URLs in the user's browser.
+
+    Only the exact DOCS_URL/REPORT_URL constants are accepted, so no computed,
+    user-supplied, or redirected destination can ever be launched. No network
+    access happens until this runs from an explicit tray click.
+    """
+    if url not in (DOCS_URL, REPORT_URL):
+        append_error("Refused to open a link that is not a fixed project URL")
+        return
+    try:
+        webbrowser.open(url)
+    except Exception:
+        # Never echo the failure text: a browser error can contain local paths.
+        append_error("Could not open the project link in a browser")
+
+
+def on_open_docs(icon, item):
+    """Explicit tray action; the browser opens only on this click."""
+    open_support_link(DOCS_URL)
+
+
+def on_report_problem(icon, item):
+    """Explicit tray action; the browser opens only on this click."""
+    open_support_link(REPORT_URL)
+
+
+def export_diagnostics(icon):
+    """Write one local diagnostic report beside the app, on explicit request.
+
+    Nothing is generated, written, or transmitted until the user picks the
+    menu item. The report is whitelist-only and stays on disk; the notice
+    names the fixed filename so no local path is ever put on screen.
+    """
+    path = os.path.join(APP_DIR, DIAGNOSTICS_FILENAME)
+    try:
+        payload = diagnostics_payload(
+            build_support_snapshot(), datetime.datetime.now(datetime.timezone.utc)
+        )
+        save_json_atomic(path, payload)
+    except Exception as exc:
+        append_error(f"Diagnostic report could not be saved: {exc}")
+        _notify(
+            icon,
+            "The report could not be saved next to Pearipherals. Check that "
+            "the app folder is writable, then try again.",
+            "Diagnostic report failed",
+        )
+        return
+    _notify(
+        icon,
+        f"Saved {DIAGNOSTICS_FILENAME} in the Pearipherals folder. Review it "
+        "before sharing it; Pearipherals never uploads it.",
+        "Diagnostic report saved",
+    )
+
+
+def on_export_diagnostics(icon, item):
+    """Explicit tray action; no report exists until the user clicks this."""
+    export_diagnostics(icon)
+
+
+def confirm_removal():
+    """Ask before any removal mutation. Anything but an explicit Yes cancels.
+
+    The ownerless dialog runs on a temporary clean thread, uses the pointer-sized
+    MessageBoxW prototype, and pre-selects No (MB_DEFBUTTON2). Cancel and X are
+    safe cancellation results. A dialog failure is cancellation, never consent.
+    """
+    if not DIALOG_LOCK.acquire(blocking=False):
+        return False
+    outcome = {}
+    finished = threading.Event()
+
+    def dialog_worker():
+        try:
+            outcome["answer"] = user32.MessageBoxW(
+                None,
+                "Prepare Pearipherals for removal?\n\n"
+                "It will turn off the Mac F-row and three-finger gestures, remove "
+                "its start-with-Windows entries, and put your original Windows "
+                "touchpad settings back.\n\n"
+                "No files are deleted and Pearipherals keeps running until you "
+                "choose Quit. Choose No, Cancel, or X to leave everything as it is.",
+                "Pearipherals — Prepare for removal",
+                MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    try:
+        worker = threading.Thread(
+            target=dialog_worker, name="PearipheralsDialog", daemon=True
+        )
+        worker.start()
+        finished.wait()
+        worker.join()
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("answer") == IDYES
+    except Exception as exc:
+        append_error(f"Removal confirmation dialog failed: {exc}")
+        return False
+    finally:
+        DIALOG_LOCK.release()
+
+
+def on_prepare_removal(icon, item):
+    """Reverse every persistent change this app made, after explicit consent.
+
+    Nothing happens without a Yes. A recovery-required config blocks automatic
+    mutation entirely and explains the manual steps instead. Each step is
+    independent, so an early failure cannot skip the remaining cleanup, and a
+    partial run is never reported as success. No file is deleted and the app is
+    never stopped: the user chooses Quit when they are ready.
+    """
+    if not confirm_removal():
+        return
+    if CONFIG_RECOVERY_ERROR is not None:
+        _notify(
+            icon,
+            "The settings file needs repair, so Pearipherals will not change "
+            "anything automatically. Untick Start with Windows, set the "
+            "3-finger gesture to Off, and use Restore original Windows "
+            "settings, then Quit.",
+            "Manual removal steps required",
+        )
+        return
+
+    def disable_settings():
+        with CONFIG_LOCK:
+            config["mac_fkeys"] = False
+            config["three_finger_mode"] = "off"
+            save_config(config)
+
+    def release_input():
+        errors = release_custom_input(
+            three_finger_drag.abort_gesture,
+            lambda: suppress_pointer.set(False),
+        )
+        if errors:
+            raise errors[0]
+
+    outcome = perform_removal({
+        "settings": disable_settings,
+        "input_release": release_input,
+        "autostart": lambda: autostart_set(False),
+        "touchpad": tp_settings.restore,
+    })
+    _notify(
+        icon,
+        format_removal_summary(outcome),
+        "Pearipherals — Prepare for removal",
+    )
+    _update_menu(icon)
 
 
 def make_icon():
@@ -1879,8 +2519,12 @@ def first_run_setup():
         return False
     try:
         autostart_set(True)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Autostart is the one promise onboarding makes about persistence.
+        # If it cannot be kept, leave onboarding pending, mutate no touchpad
+        # setting, and emit no success message; the next launch retries.
+        append_error(f"First-run autostart could not be enabled: {exc}")
+        return False
     try:
         tp_settings.apply()
     except Exception:
@@ -1903,6 +2547,10 @@ def tray_setup(icon, first_run):
     asking; say so once, rather than leaving the tray icon to be discovered
     by accident. A toast and not a dialog: this starts at logon, so nothing
     here should steal focus.
+
+    The wording states only what actually completed. It never claims a Magic
+    Keyboard, Magic Trackpad, or driver was found: nothing here probes for a
+    device, and a sleeping Bluetooth device would make any such claim a lie.
     """
     icon.visible = True
     battery_menu_refresh.start()
@@ -1923,8 +2571,11 @@ def tray_setup(icon, first_run):
     import time as _t
     _t.sleep(2)                # let the tray icon register before we toast it
     try:
-        icon.notify("Mac F-row and 3-finger swipes are on, and it now starts "
-                    "with Windows. Right-click this icon to change any of it.",
+        icon.notify("The Mac F-row and 3-finger swipes are turned on, "
+                    "recommended touchpad settings were applied, and "
+                    "Pearipherals now starts with Windows. Right-click this "
+                    "icon to change any of it, or open About / status to see "
+                    "what it can currently see.",
                     "Pearipherals is running")
     except Exception:
         pass
@@ -1965,17 +2616,10 @@ def on_quit(icon, item):
 def main():
     global tray_icon, battery_menu_refresh
     # Migrate old autostart names only when the primary config is trustworthy.
+    # This writes and verifies the current entry before removing any legacy
+    # one, so a machine can never be left with no way to start the app.
     if CONFIG_RECOVERY_ERROR is None:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                                winreg.KEY_SET_VALUE) as k:
-                for old in OLD_RUN_NAMES:
-                    try:
-                        winreg.DeleteValue(k, old)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        migrate_legacy_autostart()
     is_first_run = first_run_setup()
     # Re-assert only settings the user still asked Pearipherals to manage.
     # A recovery-required primary config disables all automatic registry writes.
@@ -2033,6 +2677,12 @@ def main():
             pystray.MenuItem("Start with Windows", on_autostart,
                              checked=lambda i: autostart_get()),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("About / status…", on_about),
+            pystray.MenuItem("Save a diagnostic report", on_export_diagnostics),
+            pystray.MenuItem("Open documentation", on_open_docs),
+            pystray.MenuItem("Report a problem", on_report_problem),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Prepare for removal…", on_prepare_removal),
             pystray.MenuItem("Quit", on_quit),
         ))
     battery_menu_refresh = WindowsTrayMenuRefreshDispatcher(
@@ -2059,7 +2709,6 @@ if __name__ == "__main__":
     log_path = os.path.join(APP_DIR, "pearipherals.err.log")
     # Early-logon resilience: explorer/tray may not exist yet, displays may
     # still be initializing. Retry the whole app a few times before giving up.
-    import datetime
     import time as _time
     import traceback
     for attempt in range(5):

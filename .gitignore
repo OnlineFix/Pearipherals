@@ -15,5 +15,8 @@ __pycache__/
 # runtime files (live next to the exe, never in git)
 pearipherals.json
 pearipherals.err.log
+pearipherals-diagnostics.json
 magicsuite.json
 magicsuite.err.log
+magickeys.json
+magickeys.err.log
