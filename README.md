@@ -105,6 +105,15 @@ trackpad driver.
 Pearipherals is portable. Its configuration and optional error log sit beside
 the EXE as `pearipherals.json` and `pearipherals.err.log`.
 
+## Help test Pearipherals
+
+Pearipherals needs reports from Apple hardware beyond the maintainer's setup.
+If you try the beta, submit a short [compatibility report](../../issues/new?template=compatibility_report.yml),
+including when everything works. A working setup is as useful as a failed setup
+because it tells us which device revisions and connection paths are reliable.
+The form asks only for product-level details and warns against sharing serial
+numbers, Bluetooth addresses, raw HID data, or other private information.
+
 ## Windows security, unsigned builds, and Smart App Control
 
 An **unsigned** prerelease has no Authenticode signature, so Windows cannot
@@ -201,7 +210,7 @@ Pearipherals first managed them.
 ```bat
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-set PEARIPHERALS_VERSION=1.2.0
+set PEARIPHERALS_VERSION=1.2.1
 build.bat
 ```
 

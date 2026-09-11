@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # A build identity is always prefixed so the reader knows exactly what was
 # measured. `git:` names the exact source revision a frozen build was produced
