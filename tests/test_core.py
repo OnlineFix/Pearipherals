@@ -1563,7 +1563,7 @@ class BatteryTests(unittest.TestCase):
         self.assertIs(snapshot, published[0])
         self.assertGreaterEqual(poller.normal_interval, 180.0)
         self.assertGreater(poller.failure_backoff, poller.normal_interval)
-        self.assertEqual(poller.failure_backoff, delay)
+        self.assertEqual(poller.normal_interval, delay)
 
     def test_hid_backend_closes_every_open_handle_even_when_query_fails(self):
         events = []
@@ -1904,6 +1904,8 @@ class BatteryTests(unittest.TestCase):
             {
                 "battery_stop": Stop(),
                 "battery_thread": Thread(),
+                "battery_lifecycle_lock": threading.Lock(),
+                "battery_shutdown": False,
                 "append_error": lambda message: events.append(message),
             },
         )
@@ -1921,7 +1923,7 @@ class BatteryTests(unittest.TestCase):
         self.assertIn("HidBatteryBackend(hidapi)", source)
         self.assertIn("target=battery_poller.run", source)
         self.assertIn("battery_stop.set()", source)
-        self.assertIn("battery_thread.join(", source)
+        self.assertIn("worker.join(", source)
         self.assertIn('battery_menu_label("keyboard")', source)
         self.assertIn('battery_menu_label("trackpad")', source)
         worker_section = source[source.index("def start_battery_worker"):source.index(

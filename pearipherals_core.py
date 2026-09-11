@@ -207,6 +207,44 @@ class BatterySnapshotStore:
             return self._snapshot
 
 
+class BatteryAlertPolicy:
+    """Pure per-device low-battery notification policy, owned by the tray thread."""
+
+    def __init__(self):
+        self._warned = {}
+        self._pending = {}
+
+    def evaluate(self, snapshot, now):
+        """Stage one combined warning; only acknowledge a non-raising attempt."""
+        self._pending = {}
+        # Never turn a delayed tray callback into an alert for an old reading.
+        if (type(snapshot.captured_at) not in (int, float)
+                or type(now) not in (int, float)
+                or not 0 <= now - snapshot.captured_at <= 600.0):
+            return ()
+        alerts = []
+        for device, result in (("Magic Keyboard", snapshot.keyboard),
+                               ("Magic Trackpad", snapshot.trackpad)):
+            if (result.status != "available" or result.stale
+                    or type(result.percentage) is not int
+                    or not 0 <= result.percentage <= 100):
+                continue
+            if result.percentage >= 25:
+                self._warned.pop(device, None)
+            if result.percentage <= 20 and not (result.charging or result.fully_charged):
+                level = 2 if result.percentage <= 5 else 1
+                if level > self._warned.get(device, 0):
+                    suffix = " (critical)" if level == 2 else ""
+                    alerts.append(f"{device}: {result.percentage}%{suffix}")
+                    self._pending[device] = level
+        return tuple(alerts)
+
+    def acknowledge(self):
+        """Consume the last evaluation, not proof Windows displayed a balloon."""
+        self._warned.update(self._pending)
+        self._pending = {}
+
+
 class HidBatteryBackend:
     """Small injected hidapi adapter with one handle lifetime per query."""
 
@@ -355,7 +393,7 @@ class BatteryPoller:
         self.publish(snapshot)
         delay = (
             self.normal_interval
-            if keyboard.status == trackpad.status == "available"
+            if "available" in (keyboard.status, trackpad.status)
             else self.failure_backoff
         )
         return snapshot, delay

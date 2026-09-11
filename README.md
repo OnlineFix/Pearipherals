@@ -77,7 +77,22 @@ that setup.
 Pearipherals shows the Apple Magic Keyboard and Magic Trackpad battery levels as
 separate entries in the tray menu. Battery polling is slow and isolated, and the
 app reopens devices for each poll instead of keeping Bluetooth HID handles open
-while a device sleeps.
+while a device sleeps. Polls run every five minutes while either device returns
+battery data, backing off to fifteen minutes when neither does.
+
+Both devices have **low-battery Windows notifications at 20% or below**, with
+one **critical escalation at 5% or below**. The first fresh low reading after
+launch warns too. Alerts are tracked separately for each device and combined
+into one notification when both need a warning in the same poll. Repeated polls
+and reconnects do not repeat a warning; a fresh reading of **25% or above** rearms
+that device. Charging/fully-charged reports suppress warnings. Missing, invalid,
+stale, or more-than-ten-minute-old readings never become a false 0% alert.
+
+Notifications are best effort: Windows notification settings, Do Not Disturb /
+Focus Assist, or Explorer can hide or suppress them, and Pearipherals cannot
+confirm display. A reported notification exception is retried on a later poll,
+not in a tight loop. The app must be running and receiving fresh battery data;
+it cannot guarantee a warning before a sleeping or disconnected device dies.
 
 ## Supported hardware and requirements
 

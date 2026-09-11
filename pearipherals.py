@@ -43,6 +43,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 from pearipherals_core import (
+    BatteryAlertPolicy,
     BatteryPoller,
     BatteryResult,
     BatterySnapshot,
@@ -1916,9 +1917,10 @@ class WindowsTrayMenuRefreshDispatcher:
     WM_APP = 0x8000
     message = WM_APP + 0x4D5
 
-    def __init__(self, icon, post_message):
+    def __init__(self, icon, post_message, on_refresh=None):
         self._icon = icon
         self._post_message = post_message
+        self._refresh_callback = on_refresh
         self._lock = threading.Lock()
         self._started = False
         self._pending = False
@@ -1965,6 +1967,11 @@ class WindowsTrayMenuRefreshDispatcher:
             self._icon.update_menu()
         except Exception:
             pass
+        with self._lock:
+            if self._closed:
+                return
+        if self._refresh_callback is not None:
+            self._refresh_callback()
 
     def close(self):
         """Prevent new posts and make an already-posted callback a no-op."""
@@ -1974,7 +1981,10 @@ class WindowsTrayMenuRefreshDispatcher:
 
 
 battery_snapshots = BatterySnapshotStore()
+battery_alert_policy = BatteryAlertPolicy()
 battery_stop = threading.Event()
+battery_lifecycle_lock = threading.Lock()
+battery_shutdown = False
 battery_thread = None
 battery_poller = None
 battery_menu_refresh = None
@@ -1985,6 +1995,18 @@ def publish_battery_snapshot(snapshot):
     battery_snapshots.publish(snapshot)
     if battery_menu_refresh is not None:
         battery_menu_refresh.schedule()
+
+
+def notify_battery_alerts(icon):
+    """Evaluate the latest complete snapshot only on the tray thread."""
+    if battery_stop.is_set():
+        return
+    alerts = battery_alert_policy.evaluate(
+        battery_snapshots.snapshot(), time.monotonic()
+    )
+    if alerts and _notify(icon, "\n".join(alerts) + "\nConnect to charge.",
+                          "Pearipherals: low battery"):
+        battery_alert_policy.acknowledge()
 
 
 def battery_menu_label(device):
@@ -2000,39 +2022,50 @@ def battery_menu_label(device):
 def start_battery_worker():
     """Start isolated slow HID polling; never call pystray from this worker."""
     global battery_stop, battery_thread, battery_poller
-    if battery_thread is not None and battery_thread.is_alive():
-        return
-    battery_stop = threading.Event()
-    try:
-        import hid as hidapi
-        battery_poller = BatteryPoller(
-            HidBatteryBackend(hidapi), publish_battery_snapshot
-        )
-    except Exception as exc:
-        unavailable = BatteryResult("unavailable")
-        publish_battery_snapshot(
-            BatterySnapshot(unavailable, unavailable, time.monotonic())
-        )
-        append_error(f"Battery worker startup failed: {exc}")
-        return
-    battery_thread = threading.Thread(
-        target=battery_poller.run, args=(battery_stop,), daemon=True,
-        name="PearipheralsBattery",
-    )
-    battery_thread.start()
+    with battery_lifecycle_lock:
+        if battery_shutdown:
+            return
+        if battery_thread is not None and battery_thread.is_alive():
+            return
+        battery_stop = threading.Event()
+        try:
+            import hid as hidapi
+            battery_poller = BatteryPoller(
+                HidBatteryBackend(hidapi), publish_battery_snapshot
+            )
+            battery_thread = threading.Thread(
+                target=battery_poller.run, args=(battery_stop,), daemon=True,
+                name="PearipheralsBattery",
+            )
+            battery_thread.start()
+        except Exception as exc:
+            battery_stop.set()
+            battery_thread = None
+            battery_poller = None
+            unavailable = BatteryResult("unavailable")
+            publish_battery_snapshot(
+                BatterySnapshot(unavailable, unavailable, time.monotonic())
+            )
+            append_error(f"Battery worker startup failed: {exc}")
 
 
 def stop_battery_worker(timeout=2.0):
     """Interrupt polling sleep and bound shutdown if hidapi is in a system call."""
-    global battery_thread
-    battery_stop.set()
-    if battery_thread is None:
+    global battery_thread, battery_shutdown
+    with battery_lifecycle_lock:
+        battery_shutdown = True
+        battery_stop.set()
+        worker = battery_thread
+    if worker is None:
         return True
-    battery_thread.join(timeout)
-    if battery_thread.is_alive():
+    # The worker may need lifecycle state while exiting; never join under lock.
+    worker.join(timeout)
+    if worker.is_alive():
         append_error("Battery worker did not stop before the shutdown deadline")
         return False
-    battery_thread = None
+    with battery_lifecycle_lock:
+        if battery_thread is worker:
+            battery_thread = None
     return True
 
 
@@ -2427,10 +2460,12 @@ def _update_menu(icon):
 
 
 def _notify(icon, message, title):
+    """Best effort: True means no Python exception, not confirmed delivery."""
     try:
         icon.notify(message, title)
     except Exception:
-        pass
+        return False
+    return True
 
 
 def on_mode_swipes(icon, item):
@@ -2553,10 +2588,8 @@ def tray_setup(icon, first_run):
     device, and a sleeping Bluetooth device would make any such claim a lie.
     """
     icon.visible = True
-    battery_menu_refresh.start()
-    # Starting after the Win32 HWND exists guarantees the initial loading ->
-    # first result transition can be marshalled back to the tray message loop.
-    start_battery_worker()
+    if not battery_menu_refresh.start():
+        return
     if CONFIG_RECOVERY_ERROR is not None:
         _notify(
             icon,
@@ -2565,20 +2598,22 @@ def tray_setup(icon, first_run):
             "repair that file, then restart Pearipherals.",
             "Config recovery required",
         )
-        return
-    if not first_run:
-        return
-    import time as _t
-    _t.sleep(2)                # let the tray icon register before we toast it
-    try:
-        icon.notify("The Mac F-row and 3-finger swipes are turned on, "
-                    "recommended touchpad settings were applied, and "
-                    "Pearipherals now starts with Windows. Right-click this "
-                    "icon to change any of it, or open About / status to see "
-                    "what it can currently see.",
-                    "Pearipherals is running")
-    except Exception:
-        pass
+    elif first_run:
+        import time as _t
+        _t.sleep(2)            # let the tray icon register before we toast it
+        if battery_stop.is_set() or not battery_menu_refresh.start():
+            return
+        _notify(icon,
+                "The Mac F-row and 3-finger swipes are turned on, "
+                "recommended touchpad settings were applied, and "
+                "Pearipherals now starts with Windows. Right-click this "
+                "icon to change any of it, or open About / status to see "
+                "what it can currently see.",
+                "Pearipherals is running")
+    # The HWND/handler and startup messages must precede the first battery
+    # result, so onboarding cannot replace an initial low-battery balloon.
+    if not battery_stop.is_set() and battery_menu_refresh.start():
+        start_battery_worker()
 
 
 def on_quit(icon, item):
@@ -2686,7 +2721,8 @@ def main():
             pystray.MenuItem("Quit", on_quit),
         ))
     battery_menu_refresh = WindowsTrayMenuRefreshDispatcher(
-        tray_icon, user32.PostMessageW
+        tray_icon, user32.PostMessageW,
+        on_refresh=lambda: notify_battery_alerts(tray_icon),
     )
     tray_icon.run(setup=lambda icon: tray_setup(icon, is_first_run))
 
