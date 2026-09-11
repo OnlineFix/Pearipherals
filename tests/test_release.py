@@ -26,6 +26,8 @@ BUILD_SCRIPT = ROOT / "build.bat"
 GITIGNORE = ROOT / ".gitignore"
 PRIVACY_POLICY = ROOT / "PRIVACY.md"
 README = ROOT / "README.md"
+COMPATIBILITY_REPORT_FORM = ISSUE_TEMPLATE_DIR / "compatibility_report.yml"
+TARGET_RELEASE_VERSION = "1.2.1"
 SPEC = importlib.util.spec_from_file_location("write_version_info", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -61,6 +63,25 @@ class ReleaseMetadataTests(unittest.TestCase):
                 text=True,
             )
             self.assertIn("ProductVersion', '1.2.3'", output.read_text(encoding="utf-8"))
+
+    def test_runtime_declares_target_release_version(self):
+        import pearipherals_version
+
+        self.assertEqual(TARGET_RELEASE_VERSION, pearipherals_version.APP_VERSION)
+
+    def test_local_and_hosted_build_defaults_match_runtime_version(self):
+        import pearipherals_version
+
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            f'if not defined PEARIPHERALS_VERSION set "PEARIPHERALS_VERSION={pearipherals_version.APP_VERSION}"',
+            build_script,
+        )
+        self.assertRegex(
+            workflow,
+            rf"(?m)^\s*default:\s*{re.escape(pearipherals_version.APP_VERSION)}\s*$",
+        )
 
     def test_release_workflow_pins_actions_and_avoids_template_injection(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -289,6 +310,12 @@ class RepositoryQualityTests(unittest.TestCase):
             with self.subTest(warning=warning):
                 self.assertIn(warning, form)
 
+    def test_bug_form_uses_a_version_neutral_release_example(self):
+        form = BUG_REPORT_FORM.read_text(encoding="utf-8").lower()
+
+        self.assertIn('placeholder: "current unsigned prerelease"', form)
+        self.assertNotIn("1.2.0 unsigned prerelease", form)
+
     def test_feature_form_captures_problem_scope_alternatives_and_safety(self):
         self.assertTrue(
             FEATURE_REQUEST_FORM.is_file(),
@@ -309,6 +336,33 @@ class RepositoryQualityTests(unittest.TestCase):
         self.assertIn("registry", form)
         self.assertIn("privacy", form)
         self.assertIn("remove sensitive information", form)
+
+    def test_compatibility_form_collects_success_and_failure_reports_safely(self):
+        self.assertTrue(
+            COMPATIBILITY_REPORT_FORM.is_file(),
+            f"missing compatibility form: {COMPATIBILITY_REPORT_FORM}",
+        )
+        form = COMPATIBILITY_REPORT_FORM.read_text(encoding="utf-8").lower()
+        for field_id in (
+            "pearipherals-version",
+            "windows-version",
+            "device-model",
+            "connection",
+            "overall-result",
+            "features-tested",
+            "privacy-confirmation",
+        ):
+            with self.subTest(field_id=field_id):
+                self.assertIn(f"id: {field_id}", form)
+        for result in ("works fully", "works partly", "does not work"):
+            self.assertIn(result, form)
+        for warning in (
+            "serial number",
+            "bluetooth address",
+            "raw hid",
+            "do not disable windows security",
+        ):
+            self.assertIn(warning, form)
 
     def test_issue_chooser_disables_blank_issues_and_links_private_security(self):
         self.assertTrue(ISSUE_CONFIG.is_file(), f"missing issue config: {ISSUE_CONFIG}")
@@ -344,6 +398,17 @@ class RepositoryQualityTests(unittest.TestCase):
 
 
 class SupportDocumentationTests(unittest.TestCase):
+    def test_readme_invites_beta_compatibility_reports(self):
+        readme = README.read_text(encoding="utf-8")
+
+        self.assertIn("## Help test Pearipherals", readme)
+        self.assertIn(
+            "../../issues/new?template=compatibility_report.yml",
+            readme,
+        )
+        self.assertIn("working setup", readme.lower())
+        self.assertIn("failed setup", readme.lower())
+
     def test_readme_documents_the_complete_support_and_lifecycle_surface(self):
         readme = README.read_text(encoding="utf-8")
         lowered = readme.lower()

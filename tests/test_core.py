@@ -3474,8 +3474,10 @@ class BuildIdentityResolutionTests(unittest.TestCase):
 
             identity = self._identity(exe_dir, meipass=meipass)()
 
+            from pearipherals_version import APP_VERSION
+
             self.assertEqual("git:" + "0" * 40, identity.build_id)
-            self.assertEqual("1.2.0", identity.version)
+            self.assertEqual(APP_VERSION, identity.version)
 
     def test_present_falsey_meipass_never_reads_adjacent_or_working_directory(self):
         with tempfile.TemporaryDirectory() as exe_dir, \
@@ -3484,13 +3486,15 @@ class BuildIdentityResolutionTests(unittest.TestCase):
             self._write_manifest(working_dir, "git:" + "f" * 40)
             previous_directory = os.getcwd()
             try:
+                from pearipherals_version import APP_VERSION
+
                 os.chdir(working_dir)
                 root_relative = os.path.splitdrive(working_dir)[1]
                 for meipass in ("", root_relative):
                     with self.subTest(meipass=meipass):
                         identity = self._identity(exe_dir, meipass=meipass)()
                         self.assertEqual("git:" + "0" * 40, identity.build_id)
-                        self.assertEqual("1.2.0", identity.version)
+                        self.assertEqual(APP_VERSION, identity.version)
             finally:
                 os.chdir(previous_directory)
 

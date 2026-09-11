@@ -16,7 +16,7 @@ body:
     attributes:
       label: Pearipherals version
       description: Use the About/version information, release name or source commit. State whether the EXE is an unsigned prerelease.
-      placeholder: "1.2.0 unsigned prerelease"
+      placeholder: "Current unsigned prerelease"
     validations:
       required: true
 

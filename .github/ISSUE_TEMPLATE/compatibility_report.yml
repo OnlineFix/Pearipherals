@@ -1,0 +1,102 @@
+name: Compatibility report
+description: Tell us whether Pearipherals works on your Apple hardware and Windows setup
+title: "[Compatibility]: "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Working and failed setups are both useful. Please report product-level details only.
+
+        **Privacy:** do not include a serial number, Bluetooth address, HID identifier, username, full local path, registry export, configuration file, error log, or credential. Do not attach raw HID data unless a maintainer has explicitly arranged a private collection process.
+
+        Do not disable Windows security protections to test Pearipherals.
+
+  - type: input
+    id: pearipherals-version
+    attributes:
+      label: Pearipherals version
+      description: Copy the version from About / status or the GitHub release name.
+      placeholder: "1.2.1 unsigned prerelease"
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Include Windows 10/11, release, and OS build. Do not include your device name.
+      placeholder: "Windows 11 24H2, OS build 26100.x"
+    validations:
+      required: true
+
+  - type: input
+    id: device-model
+    attributes:
+      label: Apple device model
+      description: List the product family and visible model revision only. Do not include any serial number or device identifier.
+      placeholder: "Magic Keyboard A2450 and Magic Trackpad 2 A1535"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - Bluetooth
+        - USB data
+        - USB-C to DisplayPort video-only
+        - Mixed connections
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: overall-result
+    attributes:
+      label: Overall result
+      options:
+        - Works fully
+        - Works partly
+        - Does not work
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: features-tested
+    attributes:
+      label: Features tested
+      description: Select every feature you actually tried.
+      options:
+        - label: Magic Keyboard F-row controls
+        - label: F6 region-selection overlay
+        - label: Magic Trackpad pointer and two-finger scrolling
+        - label: Three-finger swipes
+        - label: Three-finger drag
+        - label: Natural scrolling toggle
+        - label: Keyboard or trackpad battery display
+        - label: Display brightness
+        - label: Autostart, quit, and relaunch
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: What worked or failed?
+      description: Keep this short. For a failure, give the smallest repeatable sequence and remove private information.
+      placeholder: "F-row, battery, and two-finger scrolling work. Three-finger swipe left does not open Task View after reconnecting Bluetooth."
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: Privacy and safety confirmation
+      options:
+        - label: I removed every serial number, Bluetooth address, device identifier, username, full local path, registry value, and credential.
+          required: true
+        - label: I did not attach raw HID data, a full configuration, an error log, a registry export, or a crash dump.
+          required: true
+        - label: I did not disable or recommend disabling Windows security protections.
+          required: true
