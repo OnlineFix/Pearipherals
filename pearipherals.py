@@ -317,31 +317,158 @@ VK_M = 0x4D
 # "keys": hotkey; "restore_all": un-minimize every window (undo swipe-down)
 SWIPE_ACTIONS = {
     "up":    ("restore_all", None),
-    "down":  ("keys", ([VK_LWIN, VK_M],)),     # minimize all
+    "down":  ("minimize_all", None),          # snapshot, then Win+M
     "right": ("keys", ([VK_LWIN, VK_TAB],)),   # app choice (Task View)
     "left":  ("keys", ([VK_LWIN, VK_TAB],)),   # app choice (Task View)
 }
 
 
-def restore_all_windows():
-    """Restore every minimized visible top-level window (skip tool windows)."""
-    EnumProc = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
-    SW_RESTORE = 9
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    hwnds = []
+_WINDOW_ENUM_PROC = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+user32.EnumWindows.argtypes = [_WINDOW_ENUM_PROC, w.LPARAM]
+user32.EnumWindows.restype = w.BOOL
+for _name in ("IsWindow", "IsWindowVisible", "IsIconic", "SetForegroundWindow"):
+    getattr(user32, _name).argtypes = [w.HWND]
+    getattr(user32, _name).restype = w.BOOL
+for _name in ("GetForegroundWindow", "GetShellWindow", "GetDesktopWindow"):
+    getattr(user32, _name).argtypes = []
+    getattr(user32, _name).restype = w.HWND
+user32.GetWindowLongW.argtypes = [w.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = w.LONG
+user32.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+user32.GetWindowThreadProcessId.restype = w.DWORD
+user32.SendMessageTimeoutW.argtypes = [
+    w.HWND, w.UINT, w.WPARAM, w.LPARAM, w.UINT, w.UINT,
+    ctypes.POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, w.UINT]
+user32.SetWindowPos.restype = w.BOOL
 
-    @EnumProc
-    def cb(hwnd, lparam):
-        if user32.IsWindowVisible(hwnd) and user32.IsIconic(hwnd):
-            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if not (ex & WS_EX_TOOLWINDOW):
-                hwnds.append(hwnd)
+# Only the action worker owns this snapshot. Never infer pre-down order from
+# enumeration after minimization, and never replace it on repeated down.
+_window_cycle = None
+
+
+def _window_identity(hwnd):
+    pid = w.DWORD()
+    tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return (hwnd, pid.value, tid) if tid else None
+
+
+def _cycle_windows():
+    windows = []
+    shell = (user32.GetShellWindow(), user32.GetDesktopWindow())
+
+    @_WINDOW_ENUM_PROC
+    def collect(hwnd, _):
+        if (hwnd not in shell and user32.IsWindowVisible(hwnd)
+                and not user32.GetWindowLongW(hwnd, -20) & 0x80):
+            identity = _window_identity(hwnd)
+            # The worker never attaches input queues. SendMessageTimeout's
+            # timeout is ignored for its own queue, so exclude that thread.
+            if identity and identity[2] != threading.get_native_id():
+                windows.append(identity)
         return True
 
-    user32.EnumWindows(cb, 0)
-    for h in reversed(hwnds):
-        user32.ShowWindowAsync(h, SW_RESTORE)
+    if not user32.EnumWindows(collect, 0):
+        # Never treat an incomplete enumeration as an empty/partial snapshot.
+        raise RuntimeError("EnumWindows failed")
+    return windows
+
+
+def minimize_all_windows():
+    global _window_cycle
+    windows = _cycle_windows()
+    if _window_cycle is None:
+        _window_cycle = (windows, _window_identity(user32.GetForegroundWindow()))
+    send_keys([VK_LWIN, VK_M])
+    # SendInput only queues Win+M. Do not let an immediately queued Up race
+    # Explorer's minimize operation. Uncooperative windows cannot hold the
+    # worker indefinitely; this is a single shared one-second deadline.
+    deadline = time.monotonic() + 1.0
+    while any(_window_identity(h) == identity and not user32.IsIconic(h)
+              for identity in windows for h in [identity[0]]):
+        if time.monotonic() >= deadline:
+            append_error("Window minimize: completion deadline expired")
+            break
+        time.sleep(0.01)
+
+
+def _raise_cycle_window(identity):
+    """Order without activation or geometry changes; bound cross-queue work."""
+    hwnd = identity[0]
+    band = user32.GetWindowLongW(hwnd, -20) & 0x8  # WS_EX_TOPMOST
+
+    def at_top():
+        same_band = [i for i in _cycle_windows()
+                     if not user32.IsIconic(i[0])
+                     and user32.GetWindowLongW(i[0], -20) & 0x8 == band]
+        return bool(same_band and same_band[0] == identity)
+
+    if at_top():
+        return
+    # HWND_TOP preserves the existing topmost/non-topmost band. Never use
+    # HWND_TOPMOST/NOTOPMOST or attach input queues to force foreground.
+    if not user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x4613):
+        append_error("Window restore: Z-order request failed")
+        return
+    deadline = time.monotonic() + 0.25
+    while _window_identity(hwnd) == identity and not at_top():
+        if time.monotonic() >= deadline:
+            append_error("Window restore: Z-order completion deadline expired")
+            break
+        time.sleep(0.01)
+
+
+def restore_all_windows():
+    """Restore all eligible minimized windows; finish before final activation."""
+    global _window_cycle
+    current = _cycle_windows()
+    saved, foreground = _window_cycle if _window_cycle is not None else ([], None)
+
+    # Previously minimized/new windows still belong in an Up, below the saved
+    # stack. Validate PID/TID as well as HWND before using a saved identity.
+    ordered = [identity for identity in saved if identity in current]
+    ordered += [identity for identity in current if identity not in ordered
+                and user32.IsIconic(identity[0])]
+    for hwnd, pid, tid in reversed(ordered):
+        if (_window_identity(hwnd) != (hwnd, pid, tid)
+                or not user32.IsIconic(hwnd)):
+            continue
+        result = ctypes.c_size_t()
+        # SC_RESTORE uses the window's own saved placement. Unlike
+        # ShowWindowAsync, success here means the handler has returned, not
+        # merely that an activating restore was queued on another input queue.
+        if not user32.SendMessageTimeoutW(hwnd, 0x112, 0xF120, 0, 0x22, 250,
+                                         ctypes.byref(result)):
+            append_error("Window restore: command failed or timed out")
+            continue
+        # Custom handlers may defer their restore even after replying.
+        deadline = time.monotonic() + 0.25
+        while (_window_identity(hwnd) == (hwnd, pid, tid)
+               and user32.IsIconic(hwnd) and time.monotonic() < deadline):
+            time.sleep(0.01)
+        if user32.IsIconic(hwnd):
+            append_error("Window restore: completion deadline expired")
+    for identity in reversed(ordered):
+        if (_window_identity(identity[0]) == identity
+                and not user32.IsIconic(identity[0])):
+            _raise_cycle_window(identity)
+    if (foreground in current and _window_identity(foreground[0]) == foreground
+            and not user32.IsIconic(foreground[0])):
+        if not user32.SetForegroundWindow(foreground[0]):
+            append_error("Window restore: Windows denied foreground activation")
+        else:
+            deadline = time.monotonic() + 0.25
+            while (_window_identity(foreground[0]) == foreground
+                   and user32.GetForegroundWindow() != foreground[0]):
+                if time.monotonic() >= deadline:
+                    append_error("Window restore: foreground completion deadline expired")
+                    break
+                time.sleep(0.01)
+    if not any(_window_identity(i[0]) == i and user32.IsIconic(i[0])
+               for i in ordered):
+        _window_cycle = None
 
 # ---------------------------------------------------------------- DDC/CI brightness
 class PHYSICAL_MONITOR(ctypes.Structure):
@@ -649,14 +776,18 @@ tray_icon = None  # set later
 
 
 def worker():
+    pending = None
     while True:
-        item = actions.get()
+        item = pending if pending is not None else actions.get()
+        pending = None
         if item is None:
             return
         kind, arg = item
         try:
             if kind == "keys":
                 send_keys(*arg)
+            elif kind == "minimize_all":
+                minimize_all_windows()
             elif kind == "restore_all":
                 restore_all_windows()
             elif kind == "snip":
@@ -669,7 +800,9 @@ def worker():
                         tray_icon.title = (f"Moodio — brightness {pct}% "
                                            f"({brightness.last_backend})")
         except Exception as exc:
-            if kind == "snip":
+            if kind in ("minimize_all", "restore_all"):
+                append_error(f"Window {kind.removesuffix('_all')} failed: {exc}")
+            elif kind == "snip":
                 append_error(f"Snipping overlay launch failed: {exc}")
                 _notify(
                     tray_icon,
@@ -681,7 +814,9 @@ def worker():
             while True:
                 nxt = actions.get_nowait()
                 if nxt != item:
-                    actions.put(nxt)
+                    if nxt is None:
+                        return
+                    pending = nxt
                     break
         except queue.Empty:
             pass
