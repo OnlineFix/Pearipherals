@@ -1361,6 +1361,13 @@ class ThreeFingerDrag:
         self._anchor = self._last = None
 
     def _frame(self, hdev, rep):
+        # Share the reentrant config lock: no input/config lock-order inversion.
+        with CONFIG_LOCK:
+            if self._input_stopped:
+                return
+            self._frame_locked(hdev, rep)
+
+    def _frame_locked(self, hdev, rep):
         now = time.monotonic()
 
         # Merge this report's contacts into the rolling touch table while
@@ -1393,10 +1400,22 @@ class ThreeFingerDrag:
 
     def _process_state(self, now, moved):
         """Expire silent contacts, update suppression, and advance gestures."""
+        with CONFIG_LOCK:
+            if self._input_stopped:
+                return
+            self._process_state_locked(now, moved)
+
+    def _process_state_locked(self, now, moved):
         expire_stale_contacts(self._touch, now, self.TOUCH_TTL)
         n = len(self._touch)
         suppress_pointer.set_contacts(n)
         mode = config_value("three_finger_mode")
+
+        if mode != "drag" and self._state in ("dragging", "grace"):
+            # A failed transition LEFTUP must retry even in swipes mode. Do not
+            # synthesize anything in the new mode until the old button is up.
+            self.abort_gesture()
+            return
 
         if mode == "off":
             if self._state in ("dragging", "grace"):
@@ -1425,7 +1444,11 @@ class ThreeFingerDrag:
         return contacts_are_stable(entries, now, self.FRESH, self.MIN_AGE)
 
     def _frame_drag(self, n, now, moved):
-        if n == 3:
+        # Losing quality is equivalent to losing a finger for an owned drag:
+        # pause motion, retain the original grace deadline, and resume only
+        # after the full set is fresh and mature again.
+        if n == 3 and (self._state not in ("dragging", "grace")
+                       or self._quality(list(self._touch.values()), now)):
             entries = list(self._touch.values())
             if self._state == "idle":
                 for e in entries:            # snapshot per-contact anchors
@@ -1506,13 +1529,25 @@ class ThreeFingerDrag:
         """Timer-driven expiry also runs when the device sends no lift frame."""
         self._process_state(time.monotonic(), [])
 
+    _input_stopped = False
+
+    def fence_input(self):
+        """Drain an in-flight frame and permanently reject new synthesis."""
+        with CONFIG_LOCK:
+            self._input_stopped = True
+
     def release_pending_button(self):
         """Retry only a pending synthetic LEFTUP, without hook cleanup."""
-        if self._state in ("dragging", "grace"):
-            self._end_drag()
+        with CONFIG_LOCK:
+            if self._state in ("dragging", "grace"):
+                self._end_drag()
 
     def abort_gesture(self):
         """Fail open on malformed input: never leave pointer/button blocked."""
+        with CONFIG_LOCK:
+            self._abort_gesture_locked()
+
+    def _abort_gesture_locked(self):
         self._touch.clear()
         self._swipe_fired = False
         self._all_up_since = None
@@ -2385,21 +2420,31 @@ def on_prepare_removal(icon, item):
         with CONFIG_LOCK:
             config["mac_fkeys"] = False
             config["three_finger_mode"] = "off"
+            config["tp_settings_applied"] = False
             save_config(config)
 
+    input_errors = []
+
     def release_input():
-        errors = release_custom_input(
+        input_errors.extend(release_custom_input(
             three_finger_drag.abort_gesture,
             lambda: suppress_pointer.set(False),
-        )
-        if errors:
-            raise errors[0]
+        ))
+        if input_errors:
+            raise input_errors[0]
+
+    def restore_touchpad():
+        # Other removal steps remain independent, but native ownership must
+        # wait for successful input cleanup. Retain originals for a retry.
+        if input_errors:
+            raise input_errors[0]
+        return tp_settings.restore()
 
     outcome = perform_removal({
         "settings": disable_settings,
         "input_release": release_input,
         "autostart": lambda: autostart_set(False),
-        "touchpad": tp_settings.restore,
+        "touchpad": restore_touchpad,
     })
     _notify(
         icon,
@@ -2435,21 +2480,23 @@ def set_tf_mode(mode):
     # Custom modes must own the gesture exclusively. Off mode restores native
     # handling only while the user has explicitly applied managed settings;
     # after Restore, off mode leaves the original registry values untouched.
-    try:
-        return set_managed_mode(
-            config,
-            mode,
-            enforce=lambda requested_mode: tp_settings.enforce(),
-            save=lambda: save_config(config),
-        )
-    except Exception:
-        # A failed switch has already rolled mode off. Release any gesture that
-        # belonged to the previous mode without coupling it to hook cleanup.
-        release_custom_input(
-            three_finger_drag.abort_gesture,
-            lambda: suppress_pointer.set(False),
-        )
-        raise
+    with CONFIG_LOCK:
+        previous_mode = config["three_finger_mode"]
+        try:
+            return set_managed_mode(
+                config,
+                mode,
+                enforce=lambda requested_mode: tp_settings.enforce(),
+                save=lambda: save_config(config),
+            )
+        finally:
+            if config["three_finger_mode"] != previous_mode:
+                # Serialize the entire transition with frames and timer ticks.
+                # Failed LEFTUP remains pending for maintenance/Quit retry.
+                release_custom_input(
+                    three_finger_drag.abort_gesture,
+                    lambda: suppress_pointer.set(False),
+                )
 
 
 def _update_menu(icon):
@@ -2520,14 +2567,26 @@ def on_apply_tp(icon, item):
 
 
 def on_restore_tp(icon, item):
-    # Stop interception and release synthetic input before touching the
-    # registry; even a partial restore must fail open.
-    release_custom_input(
-        three_finger_drag.abort_gesture,
-        lambda: suppress_pointer.set(False),
-    )
     try:
-        restored = tp_settings.restore()
+        # Fence new synthesis before cleanup, and keep frames/mode changes out
+        # until native ownership has been restored (or recovery retained).
+        with CONFIG_LOCK:
+            config["three_finger_mode"] = "off"
+            errors = release_custom_input(
+                three_finger_drag.abort_gesture,
+                lambda: suppress_pointer.set(False),
+            )
+            if errors:
+                # Never hand native ownership back while LEFTUP or hook
+                # removal is pending. Keep every original for an explicit
+                # Restore retry; maintenance can still retry the button.
+                config["tp_settings_applied"] = False
+                try:
+                    save_config(config)
+                except Exception as exc:
+                    errors.append(exc)
+                raise RuntimeError("; ".join(str(error) for error in errors))
+            restored = tp_settings.restore()
     except Exception as exc:
         _notify(icon, f"Could not restore settings: {exc}",
                 "Touchpad restore failed")
@@ -2617,6 +2676,9 @@ def tray_setup(icon, first_run):
 
 
 def on_quit(icon, item):
+    # Fence before any cleanup/join can yield to the Raw Input listener. Keep
+    # the saved mode unchanged; only this process is shutting down.
+    three_finger_drag.fence_input()
     actions.put(None)
     if battery_menu_refresh is not None:
         battery_menu_refresh.close()
