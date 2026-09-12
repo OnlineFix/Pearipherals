@@ -49,6 +49,7 @@ class InputLifecycleTests(unittest.TestCase):
         )
         namespace = dict(globals_)
         namespace.setdefault("time", time)
+        namespace.setdefault("CONFIG_LOCK", CONFIG_LOCK)
         # Definitions that share the support model's fixed wording resolve it at
         # class-definition time, so the single source of truth must be present.
         from pearipherals_support import SUPPORT_ENUMS as _SUPPORT_ENUMS
@@ -1563,7 +1564,7 @@ class BatteryTests(unittest.TestCase):
         self.assertIs(snapshot, published[0])
         self.assertGreaterEqual(poller.normal_interval, 180.0)
         self.assertGreater(poller.failure_backoff, poller.normal_interval)
-        self.assertEqual(poller.failure_backoff, delay)
+        self.assertEqual(poller.normal_interval, delay)
 
     def test_hid_backend_closes_every_open_handle_even_when_query_fails(self):
         events = []
@@ -1904,6 +1905,8 @@ class BatteryTests(unittest.TestCase):
             {
                 "battery_stop": Stop(),
                 "battery_thread": Thread(),
+                "battery_lifecycle_lock": threading.Lock(),
+                "battery_shutdown": False,
                 "append_error": lambda message: events.append(message),
             },
         )
@@ -1921,7 +1924,7 @@ class BatteryTests(unittest.TestCase):
         self.assertIn("HidBatteryBackend(hidapi)", source)
         self.assertIn("target=battery_poller.run", source)
         self.assertIn("battery_stop.set()", source)
-        self.assertIn("battery_thread.join(", source)
+        self.assertIn("worker.join(", source)
         self.assertIn('battery_menu_label("keyboard")', source)
         self.assertIn('battery_menu_label("trackpad")', source)
         worker_section = source[source.index("def start_battery_worker"):source.index(
@@ -1985,6 +1988,307 @@ class BatteryTests(unittest.TestCase):
                          format_battery_label("Magic Trackpad", unavailable))
         self.assertEqual("Magic Trackpad battery: unsupported report",
                          format_battery_label("Magic Trackpad", unsupported))
+
+
+class Phase3InputBlockerTests(unittest.TestCase):
+    def setup_gesture(self, mode="drag"):
+        g, actions, suppression = GestureHardeningTests._gesture(mode)
+        cfg = dict(three_finger_mode=mode, drag_gain=1.0, drag_grace_ms=350,
+                   drag_start_units=30, swipe_units=300)
+        g._frame.__globals__["config_value"] = cfg.__getitem__
+        buttons, moves = [], []
+        g._button = buttons.append
+        g._move = lambda x, y: moves.append((x, y))
+        return g, cfg, actions, suppression, buttons, moves
+
+    def frame(self, g, when, contacts):
+        g._contacts = lambda hdev, rep: contacts
+        with mock.patch("time.monotonic", return_value=when):
+            g._frame(7, b"fake parsed contact report")
+
+    def start_drag(self, g):
+        for t in (1.0, 1.03, 1.06, 1.08):
+            self.frame(g, t, [(cid, 100 + cid, 100, True) for cid in (1, 2, 3)])
+        self.frame(g, 1.09, [(cid, 140 + cid, 100, True) for cid in (1, 2, 3)])
+        self.assertEqual("dragging", g._state)
+
+    def mode_callback(self, g, cfg, suppression, save=lambda: None):
+        set_mode = InputLifecycleTests._load_app_definition("set_tf_mode", dict(
+            config=cfg, set_managed_mode=set_managed_mode,
+            tp_settings=mock.Mock(enforce=lambda: []), save_config=lambda config: save(),
+            release_custom_input=release_custom_input, three_finger_drag=g,
+            suppress_pointer=suppression))
+        return InputLifecycleTests._load_app_definition("on_mode_swipes", dict(
+            set_tf_mode=set_mode, _update_menu=lambda icon: None))
+
+    def test_restore_cleanup_failure_retains_recovery_until_retry(self):
+        for failures in (("LEFTUP",), ("suppression",),
+                         ("LEFTUP", "suppression", "save")):
+            with self.subTest(failures=failures):
+                g, cfg, _, suppression, buttons, _ = self.setup_gesture()
+                self.start_drag(g)
+                backup = {"ThreeFingerSlideEnabled": 1}
+                cfg.update(tp_settings_backup=dict(backup), tp_settings_applied=True)
+                active_failures = set(failures)
+                writes, saved = [], []
+                def button(down):
+                    buttons.append(down)
+                    if not down and "LEFTUP" in active_failures:
+                        raise OSError("LEFTUP failed")
+                def disable(active):
+                    if "suppression" in active_failures:
+                        raise OSError("suppression failed")
+                def save():
+                    if "save" in active_failures:
+                        raise OSError("save failed")
+                    saved.append(dict(cfg))
+                g._button = button
+                suppression.set.side_effect = disable
+                manager = TouchpadSettingsManager(
+                    cfg, lambda name: 0, lambda name, value: writes.append((name, value)),
+                    lambda name: None, save)
+                notify, menu = mock.Mock(), mock.Mock()
+                callback = InputLifecycleTests._load_app_definition("on_restore_tp", dict(
+                    config=cfg, save_config=lambda cfg: save(),
+                    release_custom_input=release_custom_input, three_finger_drag=g,
+                    suppress_pointer=suppression, tp_settings=manager,
+                    _notify=notify, _update_menu=menu))
+                callback(None, None)
+                self.assertEqual([], writes, "native ownership restored despite failed cleanup")
+                self.assertEqual(backup, cfg["tp_settings_backup"])
+                self.assertEqual("off", cfg["three_finger_mode"])
+                self.assertFalse(cfg["tp_settings_applied"])
+                suppression.set.assert_called_with(False)
+                self.assertEqual("Touchpad restore failed", notify.call_args.args[2])
+                for failure in failures:
+                    self.assertIn(failure + " failed", notify.call_args.args[1])
+                menu.assert_called_once_with(None)
+                if "save" not in failures:
+                    self.assertEqual(backup, saved[-1]["tp_settings_backup"])
+                    self.assertEqual("off", saved[-1]["three_finger_mode"])
+                if "LEFTUP" in failures:
+                    self.assertIn(g._state, ("dragging", "grace"))
+                active_failures.clear()
+                with mock.patch("time.monotonic", return_value=1.30):
+                    g._maintenance()
+                callback(None, None)
+                self.assertEqual("idle", g._state)
+                self.assertEqual(1, buttons.count(True))
+                self.assertEqual([("ThreeFingerSlideEnabled", 1)], writes)
+                self.assertEqual({}, cfg["tp_settings_backup"])
+                self.assertEqual("Original touchpad settings restored", notify.call_args.args[2])
+
+    def test_restore_serializes_cleanup_and_registry_replay_against_input(self):
+        g, cfg, _, suppression, buttons, _ = self.setup_gesture()
+        self.start_drag(g)
+        cfg.update(tp_settings_backup={"ThreeFingerSlideEnabled": 1},
+                   tp_settings_applied=True)
+        observations = []
+
+        def competing_input():
+            # Nonblocking acquisition is an exact rendezvous, not a timed
+            # assertion that a thread merely has not been scheduled yet.
+            acquired = CONFIG_LOCK.acquire(blocking=False)
+            observations.append(acquired)
+            if acquired:
+                CONFIG_LOCK.release()
+
+        def check_seam():
+            worker = threading.Thread(target=competing_input)
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            # Reentrant delivery also must see Off before registry replay.
+            for t in (1.20, 1.23, 1.26, 1.28, 1.29):
+                self.frame(g, t, [(cid, (140 if t == 1.29 else 100) + cid,
+                                  100, True) for cid in (1, 2, 3)])
+
+        writes = []
+        manager = TouchpadSettingsManager(
+            cfg, lambda name: 0,
+            lambda name, value: writes.append((name, value, g._state)),
+            lambda name: None, lambda: None)
+        original_abort = g.abort_gesture
+        def abort():
+            original_abort()
+            check_seam()
+        g.abort_gesture = abort
+        def restore():
+            check_seam()
+            return manager.restore()
+        notify = mock.Mock()
+        callback = InputLifecycleTests._load_app_definition("on_restore_tp", dict(
+            config=cfg, save_config=lambda cfg: None,
+            release_custom_input=release_custom_input, three_finger_drag=g,
+            suppress_pointer=suppression, tp_settings=mock.Mock(restore=restore),
+            _notify=notify, _update_menu=mock.Mock()))
+        callback(None, None)
+        self.assertEqual([False, False], observations)
+        self.assertEqual([True, False], buttons)
+        self.assertEqual([("ThreeFingerSlideEnabled", 1, "idle")], writes)
+        self.assertEqual("off", cfg["three_finger_mode"])
+        self.assertEqual({}, cfg["tp_settings_backup"])
+        self.assertIn("restored", notify.call_args.args[2])
+
+    def test_exactly_three_reused_contacts_do_not_move_or_resume_drag(self):
+        for initial_state in ("dragging", "grace"):
+            with self.subTest(initial_state=initial_state):
+                g, _, _, suppression, buttons, moves = self.setup_gesture()
+                self.start_drag(g)
+                if initial_state == "grace":
+                    self.frame(g, 1.095, [(3, 143, 100, False)])
+                    self.assertEqual("grace", g._state)
+                self.frame(g, 1.10, [(1, 5000, 5000, True),
+                                     (2, 143, 101, True), (3, 145, 102, True)])
+                self.assertEqual(3, len(g._touch))
+                self.assertFalse(g._quality(list(g._touch.values()), 1.10))
+                suppression.set.assert_called_with(False)
+                self.assertEqual([], moves)
+                self.assertEqual("grace", g._state)
+                deadline = g._grace_deadline
+                # More rejected frames must not renew grace indefinitely.
+                for t in (1.12, 1.14):
+                    self.frame(g, t, [(1, 5000, 5000, True),
+                                      (2, 143, 101, True), (3, 145, 102, True)])
+                    self.assertEqual(deadline, g._grace_deadline)
+                    self.assertEqual([], moves)
+                # A mature fresh set resumes without a jump or second LEFTDOWN.
+                self.frame(g, 1.17, [(1, 5000, 5000, True),
+                                   (2, 143, 101, True), (3, 145, 102, True)])
+                self.assertEqual("dragging", g._state)
+                self.assertEqual([True], buttons)
+                self.assertEqual([], moves)
+                self.frame(g, 1.18, [(1, 5001, 5001, True),
+                                    (2, 144, 102, True), (3, 146, 103, True)])
+                self.assertEqual([(3.0, 3.0)], moves)
+
+    def test_unqualified_exactly_three_contacts_expire_grace(self):
+        g, _, _, suppression, buttons, moves = self.setup_gesture()
+        self.start_drag(g)
+        for t, x in ((1.10, 5000), (1.14, 100), (1.18, 5000),
+                     (1.22, 100), (1.26, 5000), (1.30, 100),
+                     (1.34, 5000), (1.38, 100), (1.42, 5000), (1.46, 100)):
+            self.frame(g, t, [(1, x, 100, True), (2, 143, 100, True),
+                              (3, 144, 100, True)])
+        self.assertEqual(3, len(g._touch))
+        self.assertEqual([], moves)
+        self.assertEqual([True, False], buttons)
+        self.assertEqual("idle", g._state)
+        suppression.set.assert_called_with(False)
+
+    def test_quit_fences_frames_during_cleanup_and_battery_join(self):
+        for failures in (0, 1, 99):
+            with self.subTest(leftup_failures=failures):
+                g, cfg, actions, suppression, buttons, moves = self.setup_gesture()
+                self.start_drag(g)
+                def button(down):
+                    buttons.append(down)
+                    if not down and buttons.count(False) <= failures:
+                        raise OSError("LEFTUP failed")
+                g._button = button
+                def late_input():
+                    for t in (1.20, 1.23, 1.26, 1.28):
+                        self.frame(g, t, [(cid, 100 + cid, 100, True)
+                                          for cid in (1, 2, 3)])
+                    self.frame(g, 1.29, [(cid, 140 + cid, 100, True)
+                                         for cid in (1, 2, 3)])
+                    with mock.patch("time.monotonic", return_value=1.30):
+                        g._maintenance()
+                stop_worker = mock.Mock(side_effect=late_input)
+                suppression.shutdown.side_effect = late_input
+                dispatcher = mock.Mock(close=mock.Mock(side_effect=late_input))
+                exits, notify = [], mock.Mock()
+                icon = mock.Mock()
+                callback = InputLifecycleTests._load_app_definition("on_quit", dict(
+                    actions=mock.Mock(), battery_menu_refresh=dispatcher,
+                    shutdown_custom_input=shutdown_custom_input, three_finger_drag=g,
+                    suppress_pointer=suppression, stop_battery_worker=stop_worker,
+                    brightness=mock.Mock(last_backend="hardware"),
+                    os=mock.Mock(_exit=exits.append), _notify=notify))
+                callback(icon, None)
+                self.assertEqual(1, buttons.count(True), "Quit reacquired LEFTDOWN")
+                self.assertEqual(min(failures + 1, 3), buttons.count(False))
+                self.assertEqual([], moves)
+                self.assertEqual([], actions)
+                self.assertEqual({}, g._touch)
+                suppression.set.assert_called_with(False)
+                self.assertEqual([0], exits)
+                stop_worker.assert_called_once_with()
+                suppression.shutdown.assert_called_once_with()
+                dispatcher.close.assert_called_once_with()
+                icon.stop.assert_called_once_with()
+                self.assertEqual(failures > 2, notify.called)
+                self.assertEqual("drag", cfg["three_finger_mode"])
+
+    def test_drag_to_swipes_releases_before_callback_returns(self):
+        g, cfg, _, suppression, buttons, _ = self.setup_gesture()
+        self.start_drag(g)
+        self.mode_callback(g, cfg, suppression)(None, None)
+        self.assertEqual([True, False], buttons)
+        self.assertEqual("idle", g._state)
+        self.assertEqual({}, g._touch)
+        suppression.set.assert_called_with(False)
+
+    def test_mode_switch_waits_for_inflight_frame(self):
+        g, cfg, _, suppression, buttons, _ = self.setup_gesture()
+        self.start_drag(g)
+        entered, resume, switching, saved = (threading.Event() for _ in range(4))
+        errors = []
+        def contacts(hdev, rep):
+            entered.set()
+            if not resume.wait(2):
+                raise AssertionError("frame rendezvous timed out")
+            return []
+        g._contacts = contacts
+        def run(fn):
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(exc)
+        callback = self.mode_callback(g, cfg, suppression, saved.set)
+        def switch():
+            switching.set()
+            callback(None, None)
+        frame = threading.Thread(target=lambda: run(lambda: g._frame(7, b"report")))
+        mode = threading.Thread(target=lambda: run(switch))
+        frame.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            mode.start()
+            self.assertTrue(switching.wait(2))
+            self.assertFalse(saved.wait(0.1), "mode changed inside an inflight frame")
+        finally:
+            resume.set()
+            frame.join(2)
+            if mode.ident is not None:
+                mode.join(2)
+        self.assertFalse(frame.is_alive())
+        self.assertFalse(mode.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual([True, False], buttons)
+
+    def test_failed_mode_release_retries_on_swipes_maintenance(self):
+        g, cfg, actions, suppression, buttons, _ = self.setup_gesture()
+        self.start_drag(g)
+        def button(down):
+            buttons.append(down)
+            if buttons.count(False) <= 2:
+                raise OSError("LEFTUP failed")
+        g._button = button
+        self.mode_callback(g, cfg, suppression)(None, None)
+        self.assertEqual([True, False], buttons)
+        self.assertIn(g._state, ("dragging", "grace"))
+        suppression.set.assert_called_with(False)
+        with mock.patch("time.monotonic", return_value=1.10):
+            with self.assertRaisesRegex(OSError, "LEFTUP failed"):
+                g._maintenance()
+        self.assertEqual([True, False, False], buttons)
+        self.assertEqual([], actions)
+        with mock.patch("time.monotonic", return_value=1.11):
+            g._maintenance()
+        self.assertEqual([True, False, False, False], buttons)
+        self.assertEqual("idle", g._state)
+        self.assertEqual({}, g._touch)
 
 
 class GestureHardeningTests(unittest.TestCase):
@@ -3183,6 +3487,38 @@ class RemovalPreparationTests(unittest.TestCase):
             "on_prepare_removal", globals_
         )
         return callback, recorded, app_config
+
+    def test_removal_does_not_restore_native_ownership_after_failed_release(self):
+        helper = Phase3InputBlockerTests()
+        g, cfg, _, suppression, buttons, _ = helper.setup_gesture()
+        helper.start_drag(g)
+        cfg.update(tp_settings_backup={"ThreeFingerSlideEnabled": 1},
+                   tp_settings_applied=True)
+        def failed_button(down):
+            buttons.append(down)
+            raise OSError("LEFTUP failed")
+        g._button = failed_button
+        writes = []
+        manager = TouchpadSettingsManager(
+            cfg, lambda name: 0, lambda name, value: writes.append((name, value)),
+            lambda name: None, lambda: None)
+        callback, recorded, _ = self._callback(
+            app_config=cfg, CONFIG_LOCK=CONFIG_LOCK, three_finger_drag=g,
+            suppress_pointer=suppression, release_custom_input=release_custom_input,
+            tp_settings=manager)
+        callback(None, None)
+        self.assertEqual([], writes)
+        self.assertEqual({"ThreeFingerSlideEnabled": 1}, cfg["tp_settings_backup"])
+        self.assertEqual("off", cfg["three_finger_mode"])
+        self.assertFalse(cfg["tp_settings_applied"])
+        self.assertIn("autostart:False", recorded)
+        suppression.set.assert_called_with(False)
+        self.assertIn(g._state, ("dragging", "grace"))
+        g._button = buttons.append
+        callback(None, None)
+        self.assertEqual([("ThreeFingerSlideEnabled", 1)], writes)
+        self.assertEqual({}, cfg["tp_settings_backup"])
+        self.assertEqual("idle", g._state)
 
     def test_confirmed_removal_disables_settings_and_restores_state(self):
         callback, recorded, app_config = self._callback()

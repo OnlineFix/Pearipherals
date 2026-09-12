@@ -43,6 +43,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 from pearipherals_core import (
+    BatteryAlertPolicy,
     BatteryPoller,
     BatteryResult,
     BatterySnapshot,
@@ -316,31 +317,158 @@ VK_M = 0x4D
 # "keys": hotkey; "restore_all": un-minimize every window (undo swipe-down)
 SWIPE_ACTIONS = {
     "up":    ("restore_all", None),
-    "down":  ("keys", ([VK_LWIN, VK_M],)),     # minimize all
+    "down":  ("minimize_all", None),          # snapshot, then Win+M
     "right": ("keys", ([VK_LWIN, VK_TAB],)),   # app choice (Task View)
     "left":  ("keys", ([VK_LWIN, VK_TAB],)),   # app choice (Task View)
 }
 
 
-def restore_all_windows():
-    """Restore every minimized visible top-level window (skip tool windows)."""
-    EnumProc = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
-    SW_RESTORE = 9
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    hwnds = []
+_WINDOW_ENUM_PROC = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+user32.EnumWindows.argtypes = [_WINDOW_ENUM_PROC, w.LPARAM]
+user32.EnumWindows.restype = w.BOOL
+for _name in ("IsWindow", "IsWindowVisible", "IsIconic", "SetForegroundWindow"):
+    getattr(user32, _name).argtypes = [w.HWND]
+    getattr(user32, _name).restype = w.BOOL
+for _name in ("GetForegroundWindow", "GetShellWindow", "GetDesktopWindow"):
+    getattr(user32, _name).argtypes = []
+    getattr(user32, _name).restype = w.HWND
+user32.GetWindowLongW.argtypes = [w.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = w.LONG
+user32.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+user32.GetWindowThreadProcessId.restype = w.DWORD
+user32.SendMessageTimeoutW.argtypes = [
+    w.HWND, w.UINT, w.WPARAM, w.LPARAM, w.UINT, w.UINT,
+    ctypes.POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, w.UINT]
+user32.SetWindowPos.restype = w.BOOL
 
-    @EnumProc
-    def cb(hwnd, lparam):
-        if user32.IsWindowVisible(hwnd) and user32.IsIconic(hwnd):
-            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if not (ex & WS_EX_TOOLWINDOW):
-                hwnds.append(hwnd)
+# Only the action worker owns this snapshot. Never infer pre-down order from
+# enumeration after minimization, and never replace it on repeated down.
+_window_cycle = None
+
+
+def _window_identity(hwnd):
+    pid = w.DWORD()
+    tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return (hwnd, pid.value, tid) if tid else None
+
+
+def _cycle_windows():
+    windows = []
+    shell = (user32.GetShellWindow(), user32.GetDesktopWindow())
+
+    @_WINDOW_ENUM_PROC
+    def collect(hwnd, _):
+        if (hwnd not in shell and user32.IsWindowVisible(hwnd)
+                and not user32.GetWindowLongW(hwnd, -20) & 0x80):
+            identity = _window_identity(hwnd)
+            # The worker never attaches input queues. SendMessageTimeout's
+            # timeout is ignored for its own queue, so exclude that thread.
+            if identity and identity[2] != threading.get_native_id():
+                windows.append(identity)
         return True
 
-    user32.EnumWindows(cb, 0)
-    for h in reversed(hwnds):
-        user32.ShowWindowAsync(h, SW_RESTORE)
+    if not user32.EnumWindows(collect, 0):
+        # Never treat an incomplete enumeration as an empty/partial snapshot.
+        raise RuntimeError("EnumWindows failed")
+    return windows
+
+
+def minimize_all_windows():
+    global _window_cycle
+    windows = _cycle_windows()
+    if _window_cycle is None:
+        _window_cycle = (windows, _window_identity(user32.GetForegroundWindow()))
+    send_keys([VK_LWIN, VK_M])
+    # SendInput only queues Win+M. Do not let an immediately queued Up race
+    # Explorer's minimize operation. Uncooperative windows cannot hold the
+    # worker indefinitely; this is a single shared one-second deadline.
+    deadline = time.monotonic() + 1.0
+    while any(_window_identity(h) == identity and not user32.IsIconic(h)
+              for identity in windows for h in [identity[0]]):
+        if time.monotonic() >= deadline:
+            append_error("Window minimize: completion deadline expired")
+            break
+        time.sleep(0.01)
+
+
+def _raise_cycle_window(identity):
+    """Order without activation or geometry changes; bound cross-queue work."""
+    hwnd = identity[0]
+    band = user32.GetWindowLongW(hwnd, -20) & 0x8  # WS_EX_TOPMOST
+
+    def at_top():
+        same_band = [i for i in _cycle_windows()
+                     if not user32.IsIconic(i[0])
+                     and user32.GetWindowLongW(i[0], -20) & 0x8 == band]
+        return bool(same_band and same_band[0] == identity)
+
+    if at_top():
+        return
+    # HWND_TOP preserves the existing topmost/non-topmost band. Never use
+    # HWND_TOPMOST/NOTOPMOST or attach input queues to force foreground.
+    if not user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x4613):
+        append_error("Window restore: Z-order request failed")
+        return
+    deadline = time.monotonic() + 0.25
+    while _window_identity(hwnd) == identity and not at_top():
+        if time.monotonic() >= deadline:
+            append_error("Window restore: Z-order completion deadline expired")
+            break
+        time.sleep(0.01)
+
+
+def restore_all_windows():
+    """Restore all eligible minimized windows; finish before final activation."""
+    global _window_cycle
+    current = _cycle_windows()
+    saved, foreground = _window_cycle if _window_cycle is not None else ([], None)
+
+    # Previously minimized/new windows still belong in an Up, below the saved
+    # stack. Validate PID/TID as well as HWND before using a saved identity.
+    ordered = [identity for identity in saved if identity in current]
+    ordered += [identity for identity in current if identity not in ordered
+                and user32.IsIconic(identity[0])]
+    for hwnd, pid, tid in reversed(ordered):
+        if (_window_identity(hwnd) != (hwnd, pid, tid)
+                or not user32.IsIconic(hwnd)):
+            continue
+        result = ctypes.c_size_t()
+        # SC_RESTORE uses the window's own saved placement. Unlike
+        # ShowWindowAsync, success here means the handler has returned, not
+        # merely that an activating restore was queued on another input queue.
+        if not user32.SendMessageTimeoutW(hwnd, 0x112, 0xF120, 0, 0x22, 250,
+                                         ctypes.byref(result)):
+            append_error("Window restore: command failed or timed out")
+            continue
+        # Custom handlers may defer their restore even after replying.
+        deadline = time.monotonic() + 0.25
+        while (_window_identity(hwnd) == (hwnd, pid, tid)
+               and user32.IsIconic(hwnd) and time.monotonic() < deadline):
+            time.sleep(0.01)
+        if user32.IsIconic(hwnd):
+            append_error("Window restore: completion deadline expired")
+    for identity in reversed(ordered):
+        if (_window_identity(identity[0]) == identity
+                and not user32.IsIconic(identity[0])):
+            _raise_cycle_window(identity)
+    if (foreground in current and _window_identity(foreground[0]) == foreground
+            and not user32.IsIconic(foreground[0])):
+        if not user32.SetForegroundWindow(foreground[0]):
+            append_error("Window restore: Windows denied foreground activation")
+        else:
+            deadline = time.monotonic() + 0.25
+            while (_window_identity(foreground[0]) == foreground
+                   and user32.GetForegroundWindow() != foreground[0]):
+                if time.monotonic() >= deadline:
+                    append_error("Window restore: foreground completion deadline expired")
+                    break
+                time.sleep(0.01)
+    if not any(_window_identity(i[0]) == i and user32.IsIconic(i[0])
+               for i in ordered):
+        _window_cycle = None
 
 # ---------------------------------------------------------------- DDC/CI brightness
 class PHYSICAL_MONITOR(ctypes.Structure):
@@ -648,14 +776,18 @@ tray_icon = None  # set later
 
 
 def worker():
+    pending = None
     while True:
-        item = actions.get()
+        item = pending if pending is not None else actions.get()
+        pending = None
         if item is None:
             return
         kind, arg = item
         try:
             if kind == "keys":
                 send_keys(*arg)
+            elif kind == "minimize_all":
+                minimize_all_windows()
             elif kind == "restore_all":
                 restore_all_windows()
             elif kind == "snip":
@@ -668,7 +800,9 @@ def worker():
                         tray_icon.title = (f"Moodio — brightness {pct}% "
                                            f"({brightness.last_backend})")
         except Exception as exc:
-            if kind == "snip":
+            if kind in ("minimize_all", "restore_all"):
+                append_error(f"Window {kind.removesuffix('_all')} failed: {exc}")
+            elif kind == "snip":
                 append_error(f"Snipping overlay launch failed: {exc}")
                 _notify(
                     tray_icon,
@@ -680,7 +814,9 @@ def worker():
             while True:
                 nxt = actions.get_nowait()
                 if nxt != item:
-                    actions.put(nxt)
+                    if nxt is None:
+                        return
+                    pending = nxt
                     break
         except queue.Empty:
             pass
@@ -1360,6 +1496,13 @@ class ThreeFingerDrag:
         self._anchor = self._last = None
 
     def _frame(self, hdev, rep):
+        # Share the reentrant config lock: no input/config lock-order inversion.
+        with CONFIG_LOCK:
+            if self._input_stopped:
+                return
+            self._frame_locked(hdev, rep)
+
+    def _frame_locked(self, hdev, rep):
         now = time.monotonic()
 
         # Merge this report's contacts into the rolling touch table while
@@ -1392,10 +1535,22 @@ class ThreeFingerDrag:
 
     def _process_state(self, now, moved):
         """Expire silent contacts, update suppression, and advance gestures."""
+        with CONFIG_LOCK:
+            if self._input_stopped:
+                return
+            self._process_state_locked(now, moved)
+
+    def _process_state_locked(self, now, moved):
         expire_stale_contacts(self._touch, now, self.TOUCH_TTL)
         n = len(self._touch)
         suppress_pointer.set_contacts(n)
         mode = config_value("three_finger_mode")
+
+        if mode != "drag" and self._state in ("dragging", "grace"):
+            # A failed transition LEFTUP must retry even in swipes mode. Do not
+            # synthesize anything in the new mode until the old button is up.
+            self.abort_gesture()
+            return
 
         if mode == "off":
             if self._state in ("dragging", "grace"):
@@ -1424,7 +1579,11 @@ class ThreeFingerDrag:
         return contacts_are_stable(entries, now, self.FRESH, self.MIN_AGE)
 
     def _frame_drag(self, n, now, moved):
-        if n == 3:
+        # Losing quality is equivalent to losing a finger for an owned drag:
+        # pause motion, retain the original grace deadline, and resume only
+        # after the full set is fresh and mature again.
+        if n == 3 and (self._state not in ("dragging", "grace")
+                       or self._quality(list(self._touch.values()), now)):
             entries = list(self._touch.values())
             if self._state == "idle":
                 for e in entries:            # snapshot per-contact anchors
@@ -1505,13 +1664,25 @@ class ThreeFingerDrag:
         """Timer-driven expiry also runs when the device sends no lift frame."""
         self._process_state(time.monotonic(), [])
 
+    _input_stopped = False
+
+    def fence_input(self):
+        """Drain an in-flight frame and permanently reject new synthesis."""
+        with CONFIG_LOCK:
+            self._input_stopped = True
+
     def release_pending_button(self):
         """Retry only a pending synthetic LEFTUP, without hook cleanup."""
-        if self._state in ("dragging", "grace"):
-            self._end_drag()
+        with CONFIG_LOCK:
+            if self._state in ("dragging", "grace"):
+                self._end_drag()
 
     def abort_gesture(self):
         """Fail open on malformed input: never leave pointer/button blocked."""
+        with CONFIG_LOCK:
+            self._abort_gesture_locked()
+
+    def _abort_gesture_locked(self):
         self._touch.clear()
         self._swipe_fired = False
         self._all_up_since = None
@@ -1916,9 +2087,10 @@ class WindowsTrayMenuRefreshDispatcher:
     WM_APP = 0x8000
     message = WM_APP + 0x4D5
 
-    def __init__(self, icon, post_message):
+    def __init__(self, icon, post_message, on_refresh=None):
         self._icon = icon
         self._post_message = post_message
+        self._refresh_callback = on_refresh
         self._lock = threading.Lock()
         self._started = False
         self._pending = False
@@ -1965,6 +2137,11 @@ class WindowsTrayMenuRefreshDispatcher:
             self._icon.update_menu()
         except Exception:
             pass
+        with self._lock:
+            if self._closed:
+                return
+        if self._refresh_callback is not None:
+            self._refresh_callback()
 
     def close(self):
         """Prevent new posts and make an already-posted callback a no-op."""
@@ -1974,7 +2151,10 @@ class WindowsTrayMenuRefreshDispatcher:
 
 
 battery_snapshots = BatterySnapshotStore()
+battery_alert_policy = BatteryAlertPolicy()
 battery_stop = threading.Event()
+battery_lifecycle_lock = threading.Lock()
+battery_shutdown = False
 battery_thread = None
 battery_poller = None
 battery_menu_refresh = None
@@ -1985,6 +2165,18 @@ def publish_battery_snapshot(snapshot):
     battery_snapshots.publish(snapshot)
     if battery_menu_refresh is not None:
         battery_menu_refresh.schedule()
+
+
+def notify_battery_alerts(icon):
+    """Evaluate the latest complete snapshot only on the tray thread."""
+    if battery_stop.is_set():
+        return
+    alerts = battery_alert_policy.evaluate(
+        battery_snapshots.snapshot(), time.monotonic()
+    )
+    if alerts and _notify(icon, "\n".join(alerts) + "\nConnect to charge.",
+                          "Pearipherals: low battery"):
+        battery_alert_policy.acknowledge()
 
 
 def battery_menu_label(device):
@@ -2000,39 +2192,50 @@ def battery_menu_label(device):
 def start_battery_worker():
     """Start isolated slow HID polling; never call pystray from this worker."""
     global battery_stop, battery_thread, battery_poller
-    if battery_thread is not None and battery_thread.is_alive():
-        return
-    battery_stop = threading.Event()
-    try:
-        import hid as hidapi
-        battery_poller = BatteryPoller(
-            HidBatteryBackend(hidapi), publish_battery_snapshot
-        )
-    except Exception as exc:
-        unavailable = BatteryResult("unavailable")
-        publish_battery_snapshot(
-            BatterySnapshot(unavailable, unavailable, time.monotonic())
-        )
-        append_error(f"Battery worker startup failed: {exc}")
-        return
-    battery_thread = threading.Thread(
-        target=battery_poller.run, args=(battery_stop,), daemon=True,
-        name="PearipheralsBattery",
-    )
-    battery_thread.start()
+    with battery_lifecycle_lock:
+        if battery_shutdown:
+            return
+        if battery_thread is not None and battery_thread.is_alive():
+            return
+        battery_stop = threading.Event()
+        try:
+            import hid as hidapi
+            battery_poller = BatteryPoller(
+                HidBatteryBackend(hidapi), publish_battery_snapshot
+            )
+            battery_thread = threading.Thread(
+                target=battery_poller.run, args=(battery_stop,), daemon=True,
+                name="PearipheralsBattery",
+            )
+            battery_thread.start()
+        except Exception as exc:
+            battery_stop.set()
+            battery_thread = None
+            battery_poller = None
+            unavailable = BatteryResult("unavailable")
+            publish_battery_snapshot(
+                BatterySnapshot(unavailable, unavailable, time.monotonic())
+            )
+            append_error(f"Battery worker startup failed: {exc}")
 
 
 def stop_battery_worker(timeout=2.0):
     """Interrupt polling sleep and bound shutdown if hidapi is in a system call."""
-    global battery_thread
-    battery_stop.set()
-    if battery_thread is None:
+    global battery_thread, battery_shutdown
+    with battery_lifecycle_lock:
+        battery_shutdown = True
+        battery_stop.set()
+        worker = battery_thread
+    if worker is None:
         return True
-    battery_thread.join(timeout)
-    if battery_thread.is_alive():
+    # The worker may need lifecycle state while exiting; never join under lock.
+    worker.join(timeout)
+    if worker.is_alive():
         append_error("Battery worker did not stop before the shutdown deadline")
         return False
-    battery_thread = None
+    with battery_lifecycle_lock:
+        if battery_thread is worker:
+            battery_thread = None
     return True
 
 
@@ -2352,21 +2555,31 @@ def on_prepare_removal(icon, item):
         with CONFIG_LOCK:
             config["mac_fkeys"] = False
             config["three_finger_mode"] = "off"
+            config["tp_settings_applied"] = False
             save_config(config)
 
+    input_errors = []
+
     def release_input():
-        errors = release_custom_input(
+        input_errors.extend(release_custom_input(
             three_finger_drag.abort_gesture,
             lambda: suppress_pointer.set(False),
-        )
-        if errors:
-            raise errors[0]
+        ))
+        if input_errors:
+            raise input_errors[0]
+
+    def restore_touchpad():
+        # Other removal steps remain independent, but native ownership must
+        # wait for successful input cleanup. Retain originals for a retry.
+        if input_errors:
+            raise input_errors[0]
+        return tp_settings.restore()
 
     outcome = perform_removal({
         "settings": disable_settings,
         "input_release": release_input,
         "autostart": lambda: autostart_set(False),
-        "touchpad": tp_settings.restore,
+        "touchpad": restore_touchpad,
     })
     _notify(
         icon,
@@ -2402,21 +2615,23 @@ def set_tf_mode(mode):
     # Custom modes must own the gesture exclusively. Off mode restores native
     # handling only while the user has explicitly applied managed settings;
     # after Restore, off mode leaves the original registry values untouched.
-    try:
-        return set_managed_mode(
-            config,
-            mode,
-            enforce=lambda requested_mode: tp_settings.enforce(),
-            save=lambda: save_config(config),
-        )
-    except Exception:
-        # A failed switch has already rolled mode off. Release any gesture that
-        # belonged to the previous mode without coupling it to hook cleanup.
-        release_custom_input(
-            three_finger_drag.abort_gesture,
-            lambda: suppress_pointer.set(False),
-        )
-        raise
+    with CONFIG_LOCK:
+        previous_mode = config["three_finger_mode"]
+        try:
+            return set_managed_mode(
+                config,
+                mode,
+                enforce=lambda requested_mode: tp_settings.enforce(),
+                save=lambda: save_config(config),
+            )
+        finally:
+            if config["three_finger_mode"] != previous_mode:
+                # Serialize the entire transition with frames and timer ticks.
+                # Failed LEFTUP remains pending for maintenance/Quit retry.
+                release_custom_input(
+                    three_finger_drag.abort_gesture,
+                    lambda: suppress_pointer.set(False),
+                )
 
 
 def _update_menu(icon):
@@ -2427,10 +2642,12 @@ def _update_menu(icon):
 
 
 def _notify(icon, message, title):
+    """Best effort: True means no Python exception, not confirmed delivery."""
     try:
         icon.notify(message, title)
     except Exception:
-        pass
+        return False
+    return True
 
 
 def on_mode_swipes(icon, item):
@@ -2485,14 +2702,26 @@ def on_apply_tp(icon, item):
 
 
 def on_restore_tp(icon, item):
-    # Stop interception and release synthetic input before touching the
-    # registry; even a partial restore must fail open.
-    release_custom_input(
-        three_finger_drag.abort_gesture,
-        lambda: suppress_pointer.set(False),
-    )
     try:
-        restored = tp_settings.restore()
+        # Fence new synthesis before cleanup, and keep frames/mode changes out
+        # until native ownership has been restored (or recovery retained).
+        with CONFIG_LOCK:
+            config["three_finger_mode"] = "off"
+            errors = release_custom_input(
+                three_finger_drag.abort_gesture,
+                lambda: suppress_pointer.set(False),
+            )
+            if errors:
+                # Never hand native ownership back while LEFTUP or hook
+                # removal is pending. Keep every original for an explicit
+                # Restore retry; maintenance can still retry the button.
+                config["tp_settings_applied"] = False
+                try:
+                    save_config(config)
+                except Exception as exc:
+                    errors.append(exc)
+                raise RuntimeError("; ".join(str(error) for error in errors))
+            restored = tp_settings.restore()
     except Exception as exc:
         _notify(icon, f"Could not restore settings: {exc}",
                 "Touchpad restore failed")
@@ -2553,10 +2782,8 @@ def tray_setup(icon, first_run):
     device, and a sleeping Bluetooth device would make any such claim a lie.
     """
     icon.visible = True
-    battery_menu_refresh.start()
-    # Starting after the Win32 HWND exists guarantees the initial loading ->
-    # first result transition can be marshalled back to the tray message loop.
-    start_battery_worker()
+    if not battery_menu_refresh.start():
+        return
     if CONFIG_RECOVERY_ERROR is not None:
         _notify(
             icon,
@@ -2565,23 +2792,28 @@ def tray_setup(icon, first_run):
             "repair that file, then restart Pearipherals.",
             "Config recovery required",
         )
-        return
-    if not first_run:
-        return
-    import time as _t
-    _t.sleep(2)                # let the tray icon register before we toast it
-    try:
-        icon.notify("The Mac F-row and 3-finger swipes are turned on, "
-                    "recommended touchpad settings were applied, and "
-                    "Pearipherals now starts with Windows. Right-click this "
-                    "icon to change any of it, or open About / status to see "
-                    "what it can currently see.",
-                    "Pearipherals is running")
-    except Exception:
-        pass
+    elif first_run:
+        import time as _t
+        _t.sleep(2)            # let the tray icon register before we toast it
+        if battery_stop.is_set() or not battery_menu_refresh.start():
+            return
+        _notify(icon,
+                "The Mac F-row and 3-finger swipes are turned on, "
+                "recommended touchpad settings were applied, and "
+                "Pearipherals now starts with Windows. Right-click this "
+                "icon to change any of it, or open About / status to see "
+                "what it can currently see.",
+                "Pearipherals is running")
+    # The HWND/handler and startup messages must precede the first battery
+    # result, so onboarding cannot replace an initial low-battery balloon.
+    if not battery_stop.is_set() and battery_menu_refresh.start():
+        start_battery_worker()
 
 
 def on_quit(icon, item):
+    # Fence before any cleanup/join can yield to the Raw Input listener. Keep
+    # the saved mode unchanged; only this process is shutting down.
+    three_finger_drag.fence_input()
     actions.put(None)
     if battery_menu_refresh is not None:
         battery_menu_refresh.close()
@@ -2686,7 +2918,8 @@ def main():
             pystray.MenuItem("Quit", on_quit),
         ))
     battery_menu_refresh = WindowsTrayMenuRefreshDispatcher(
-        tray_icon, user32.PostMessageW
+        tray_icon, user32.PostMessageW,
+        on_refresh=lambda: notify_battery_alerts(tray_icon),
     )
     tray_icon.run(setup=lambda icon: tray_setup(icon, is_first_run))
 
