@@ -5,11 +5,26 @@ Keyboard and Magic Trackpad 2. It adds Mac-style function keys, three-finger
 trackpad gestures, battery levels, natural scrolling, and display brightness
 controls in one portable EXE.**
 
-Windows can pair Apple's Bluetooth keyboard and trackpad, but support is limited.
-The Magic Keyboard function row does not behave like it does on a Mac, Windows
-cannot reliably recognize three-finger gestures from the Bluetooth Magic
-Trackpad 2, and peripheral battery levels are hard to find. Pearipherals fills
-those gaps without a subscription or proprietary driver.
+## Try the v1.2.1 unsigned beta
+
+**[Download v1.2.1 for Windows (unsigned EXE)](https://github.com/OnlineFix/Pearipherals/releases/download/v1.2.1-unsigned/Pearipherals-1.2.1-unsigned.exe)**
+· [Release notes and SHA-256 checksum](https://github.com/OnlineFix/Pearipherals/releases/tag/v1.2.1-unsigned)
+
+For **Windows 10/11 x64**, Apple Magic Keyboard and Magic Trackpad 2 over
+Bluetooth. Trackpad pointer movement and two-finger scrolling require the
+separately installed [mac-precision-touchpad driver](https://github.com/imbushuo/mac-precision-touchpad).
+Not every hardware revision or setup has been validated; see the release notes
+for testing limits.
+
+> **Unsigned beta:** Windows cannot verify the publisher. SmartScreen may warn;
+> Smart App Control may block it without a per-app bypass. Do not disable
+> system-wide security protections to run it.
+> [Read the security warning](#windows-security-unsigned-builds-and-smart-app-control).
+
+[Quick start](#download-and-quick-start) · [Requirements](#supported-hardware-and-requirements) · [Removal guide](#uninstall)
+
+Use the versioned link above for this beta; GitHub's **Latest** release is still
+v1.1.
 
 ## Features
 
@@ -18,7 +33,7 @@ those gaps without a subscription or proprietary driver.
 | **"Tragic" Keyboard** | Mac-style function row for an Apple Magic Keyboard on Windows |
 | **"Tragic" Trackpad** | Three-finger swipes or drag for Magic Trackpad 2 on Windows |
 | **"Moodio" Display** | Brightness keys for Apple Studio Display and other monitors |
-| **Battery monitoring** | Separate Magic Keyboard and Magic Trackpad battery levels in the tray |
+| **Battery monitoring** | Separate keyboard/trackpad battery levels and low-battery alerts |
 | **Portable Windows app** | One EXE, local configuration, no account, no telemetry |
 
 ## "Tragic" Keyboard: Apple function keys on Windows
@@ -109,9 +124,9 @@ trackpad driver.
 ## Download and quick start
 
 1. For Magic Trackpad 2, install the mac-precision-touchpad driver.
-2. Download the latest build from [GitHub Releases](../../releases). Unsigned
-   downloads are identified in their release title, notes, and EXE filename;
-   check the applicable release notes before downloading.
+2. Read the [v1.2.1 unsigned beta release notes](https://github.com/OnlineFix/Pearipherals/releases/tag/v1.2.1-unsigned)
+   for security warnings, checksums, and update/rollback instructions, then use
+   the [beta download above](#try-the-v121-unsigned-beta).
 3. Put it anywhere you control, such as `C:\Tools\Pearipherals`.
 4. Run it. Pearipherals enables autostart and applies the touchpad settings its
    gestures need on first launch, then shows a notification explaining what
@@ -208,17 +223,21 @@ delete the old MagicSuite EXE.
 
 1. Select **Prepare for removal…** and confirm. This reverses every persistent
    change in one step and tells you if anything could not be completed.
+   Resolve any reported restoration failure before deleting your settings backup.
    You can still do it by hand instead: untick **Start with Windows**, set the
    3-finger gesture to **Off**, then use **Touchpad settings** →
    **Restore original Windows settings**.
 2. Select **Quit**.
-3. Delete `Pearipherals.exe` and its adjacent runtime files, if present:
+3. Delete the EXE (`Pearipherals-1.2.1-unsigned.exe` for this beta, or
+   `Pearipherals.exe`) and its adjacent runtime files, if present:
    `pearipherals.json`, `pearipherals.err.log`, and
    `pearipherals-diagnostics.json`.
 
 This removes Pearipherals, its autostart entry, and its local configuration/log.
 The Restore action replays the Windows touchpad values backed up before
 Pearipherals first managed them.
+
+The separately installed trackpad driver is not removed by deleting Pearipherals.
 
 ## Build Pearipherals from source
 
