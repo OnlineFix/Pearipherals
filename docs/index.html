@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pearipherals — Apple Magic Keyboard &amp; Magic Trackpad 2 for Windows</title>
+  <meta name="description" content="Free, open-source Windows companion for Apple Magic Keyboard and Magic Trackpad 2: function keys, three-finger gestures and battery alerts. Setup, driver requirements and unsigned beta safety.">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://onlinefix.github.io/Pearipherals/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Pearipherals">
+  <meta property="og:title" content="Apple Magic Keyboard and Magic Trackpad 2 for Windows — Pearipherals">
+  <meta property="og:description" content="A free Windows tray companion for function keys, three-finger gestures and battery alerts. Read the driver requirements and unsigned beta warning before downloading.">
+  <meta property="og:url" content="https://onlinefix.github.io/Pearipherals/">
+  <meta name="theme-color" content="#215333">
+  <style>
+    :root { color-scheme: light; --ink: #202820; --muted: #485448; --green: #215333; --paper: #fafbf8; --line: #c6cec3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: "Segoe UI", Arial, sans-serif; font-size: 1.0625rem; line-height: 1.65; }
+    header, main, footer { max-width: 54rem; margin-inline: auto; padding: 1.5rem; }
+    header { border-bottom: 1px solid var(--line); }
+    .brand { font-size: 1.3rem; font-weight: 750; margin: 0; }
+    nav { display: flex; flex-wrap: wrap; gap: .25rem 1.25rem; margin-top: .5rem; }
+    nav a, footer a { display: inline-flex; align-items: center; min-height: 44px; }
+    a { color: var(--green); text-underline-offset: .18em; overflow-wrap: anywhere; }
+    a:hover { text-decoration-thickness: .16em; }
+    a:focus-visible { outline: 3px solid var(--green); outline-offset: 4px; }
+    h1, h2, h3 { line-height: 1.2; text-wrap: balance; }
+    h1 { font-size: clamp(2rem, 5vw, 3rem); max-width: 23ch; margin: .35rem 0 1.25rem; }
+    h2 { font-size: 1.65rem; margin: 0 0 1rem; }
+    h3 { font-size: 1.15rem; margin-top: 1.5rem; }
+    p, ul, ol, dl { margin: 0 0 1rem; }
+    li { margin-block: .45rem; }
+    section { padding-block: 2rem; border-bottom: 1px solid var(--line); scroll-margin-top: 1rem; }
+    .intro { padding-top: 1rem; }
+    .eyebrow { color: var(--muted); font-weight: 650; }
+    .warning { padding: 1.25rem; background: #fff4dc; border: 1px solid #a36d1f; margin-block: 1.5rem; }
+    .warning h3 { margin-top: 0; }
+    .warning p:last-child { margin-bottom: 0; }
+    .button { display: inline-block; padding: .75rem 1rem; background: var(--green); color: white; font-weight: 650; border-radius: .25rem; }
+    .note { color: var(--muted); }
+    dt { font-weight: 700; margin-top: 1.5rem; }
+    dd { margin: .4rem 0 1rem; }
+    code { font-size: .9em; overflow-wrap: anywhere; }
+    footer { font-size: .95rem; color: var(--muted); }
+    .skip { position: absolute; left: 1rem; top: -10rem; padding: .75rem; background: white; }
+    .skip:focus { top: 1rem; }
+    @media (max-width: 420px) { header, main, footer { padding-inline: 1rem; } }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header>
+    <p class="brand">Pearipherals</p>
+    <nav aria-label="Main navigation">
+      <a href="#features">Features</a><a href="#setup">Installation</a><a href="#removal">Removal</a><a href="#faq">FAQ</a><a href="https://github.com/OnlineFix/Pearipherals">Source on GitHub</a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="intro" aria-labelledby="intro-title">
+      <p class="eyebrow">Free, open source · Windows tray app · MIT license</p>
+      <h1 id="intro-title">Apple Magic Keyboard and Magic Trackpad 2 for Windows</h1>
+      <p>Pearipherals adds Mac-style function keys, custom three-finger gestures, separate keyboard and trackpad battery levels, and low-battery warnings. It runs locally as a portable Windows app, without an account or telemetry.</p>
+      <p><strong>A companion utility, not a trackpad driver.</strong> Magic Trackpad 2 pointer movement and two-finger scrolling require the separately installed <a href="https://github.com/imbushuo/mac-precision-touchpad">mac-precision-touchpad driver</a>. Pearipherals adds controls and features on top; it does not bundle or replace that driver.</p>
+      <p>Intended for <strong>Windows 10/11 x64</strong> with Apple Magic Keyboard and Magic Trackpad 2 over <strong>Bluetooth</strong>. Not every hardware revision or setup has been validated. USB-C models and Windows on ARM are not claimed as validated here.</p>
+      <aside class="warning" aria-labelledby="unsigned-warning">
+        <h3 id="unsigned-warning">Before downloading: unsigned beta</h3>
+        <p>The v1.2.1 EXE has <strong>no Authenticode signature</strong>. Windows cannot verify its publisher. SmartScreen may warn; Smart App Control may block it without a per-app exception. <strong>Do not disable system-wide security protections to run it.</strong></p>
+        <p>The published binary was inspected and scanned, but was <strong>not separately hardware-tested</strong>. A clean scan does not guarantee safety. A SHA-256 checksum checks file integrity, not publisher identity or safety. Read the release notes and testing limits before deciding whether to try it.</p>
+      </aside>
+      <p><a class="button" href="https://github.com/OnlineFix/Pearipherals/releases/tag/v1.2.1-unsigned">Get v1.2.1 unsigned beta — release notes &amp; download</a></p>
+      <p class="note">This link opens the exact beta release, with its warning and checksum, rather than GitHub’s “Latest” release. <a href="https://github.com/OnlineFix/Pearipherals/blob/main/CODE_SIGNING_POLICY.md">Code signing policy</a>.</p>
+    </section>
+
+    <section id="features" aria-labelledby="features-title">
+      <h2 id="features-title">What Pearipherals adds</h2>
+      <h3>Magic Keyboard function keys on Windows</h3>
+      <p>F1/F2 adjust display brightness; F3 opens Task View; F4 opens Windows Search. F6 opens the Windows Snipping Tool selection overlay. F7–F9 control media, and F10–F12 control mute and volume. F5 passes through unchanged.</p>
+      <p>Hold <strong>Ctrl, Alt, Shift or Win</strong> to send the original F-key, so shortcuts such as Alt+F4 still work. The Mac F-row can be switched off from the tray. Brightness uses available display controls, with gamma dimming as a fallback; behavior depends on the display and connection.</p>
+      <h3>Magic Trackpad 2 three-finger gestures</h3>
+      <p>Choose <strong>Swipes</strong> (down to minimize, up to restore, left/right for Task View), <strong>Drag</strong> for three-finger dragging and text selection, or <strong>Off</strong>. Normal pointer movement and two-finger scrolling stay with the separate driver.</p>
+      <p>A natural-scrolling toggle is included. Reconnect the trackpad or reboot after changing it, because Windows reads that setting when the device connects. Four-finger gestures are not handled.</p>
+      <h3>Battery levels and low-battery warnings</h3>
+      <p>The tray shows keyboard and trackpad battery values separately. Fresh readings trigger low-battery notifications at <strong>20% or below</strong>, with one critical escalation at <strong>5% or below</strong>. A fresh reading of 25% or above rearms that device; charging reports suppress warnings.</p>
+      <p>Warnings are best effort, not a guarantee before a battery dies. The app must be running and receiving fresh data. Sleeping or disconnected devices, Windows notification settings and Do Not Disturb can prevent warnings. Real low-battery transitions and hardware sleep/wake were not explicitly tested for this release.</p>
+      <p><a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#features">Full feature documentation and limitations</a></p>
+    </section>
+
+    <section id="setup" aria-labelledby="setup-title">
+      <h2 id="setup-title">Installation and first launch</h2>
+      <ol>
+        <li>Check the Windows and Bluetooth hardware requirements above. For Magic Trackpad 2 pointer movement and two-finger scrolling, follow the <a href="https://github.com/imbushuo/mac-precision-touchpad">separate driver’s installation documentation</a>. Keyboard mappings, battery display and monitor controls do not require that trackpad driver.</li>
+        <li>Read the <a href="https://github.com/OnlineFix/Pearipherals/releases/tag/v1.2.1-unsigned">v1.2.1 unsigned release notes</a>, including the warning, checksum and testing limits. If your security policy blocks the app, do not weaken protections to proceed.</li>
+        <li>Keep the portable EXE in a persistent folder you control, such as <code>C:\Tools\Pearipherals</code>. When updating, back up the old EXE and its adjacent <code>pearipherals.json</code>, then quit the old instance before replacing files. Preserve the original touchpad-settings backup in that configuration.</li>
+        <li>Launch only when ready: <strong>first launch enables autostart and applies touchpad settings</strong>, then explains those changes in a notification. The configuration and optional error log stay beside the EXE.</li>
+        <li>Open <strong>About / status…</strong> from the tray to check the version, build identity and observed device state. Choose the function-key and gesture options you want. Keep your previous EXE and matching configuration backup until satisfied with an update.</li>
+      </ol>
+      <p><a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#download-and-quick-start">Complete quick start</a> · <a href="https://github.com/OnlineFix/Pearipherals/releases/tag/v1.2.1-unsigned">Update and rollback instructions</a></p>
+    </section>
+
+    <section id="removal" aria-labelledby="removal-title">
+      <h2 id="removal-title">How to remove Pearipherals</h2>
+      <ol>
+        <li>Select <strong>Prepare for removal…</strong> in the tray, confirm and inspect every result. It disables custom input features, removes startup entries and restores backed-up Windows touchpad settings. Resolve any reported restoration failure before deleting the settings backup.</li>
+        <li>Select <strong>Quit</strong>. Preparing for removal does not quit the app or delete files.</li>
+        <li>Delete the EXE and adjacent runtime files you no longer need: <code>pearipherals.json</code>, <code>pearipherals.err.log</code> and <code>pearipherals-diagnostics.json</code>.</li>
+      </ol>
+      <p><strong>The separately installed trackpad driver is not removed by deleting Pearipherals.</strong> See the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#uninstall">full removal guide</a> for the manual recovery alternative.</p>
+    </section>
+
+    <section id="faq" aria-labelledby="faq-title">
+      <h2 id="faq-title">Frequently asked questions</h2>
+      <dl>
+        <dt>Can I use Apple Magic Trackpad 2 on Windows 11?</dt>
+        <dd>The mac-precision-touchpad driver supplies normal pointer movement and two-finger scrolling. Pearipherals is a companion for custom three-finger gestures, natural-scrolling control and battery display. The documented setup is Bluetooth on Windows 10/11 x64; it is not a guarantee for every hardware revision.</dd>
+        <dt>Can I use Magic Keyboard F-keys like a Mac?</dt>
+        <dd>Pearipherals provides brightness, Task View, Search, Snipping Tool, media and volume actions. Hold Ctrl, Alt, Shift or Win for the original F-key. The keyboard’s Fn key is not exposed over this Bluetooth path.</dd>
+        <dt>Why is a battery reading missing, or a warning not showing?</dt>
+        <dd>A sleeping or disconnected device may not provide fresh battery data. Missing or stale data is not treated as zero. Notifications also depend on Windows settings and Explorer. Check About / status and the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#magic-keyboard-and-magic-trackpad-battery-levels">battery documentation</a>.</dd>
+        <dt>Why does Windows show an unknown publisher?</dt>
+        <dd>The current beta is unsigned. The public source and checksum do not substitute for a trusted digital signature. Review the <a href="#unsigned-warning">warning above</a> and do not disable security protections to run it.</dd>
+        <dt>Is it free, and does it upload data?</dt>
+        <dd>Pearipherals is free and <a href="https://github.com/OnlineFix/Pearipherals/blob/main/LICENSE">MIT-licensed</a>, with no paid tier, account, telemetry or automatic uploads. Optional diagnostics are saved locally only when requested, for you to review before sharing. Read the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/PRIVACY.md">application privacy policy</a>.</dd>
+        <dt>Where can I report a problem or working setup?</dt>
+        <dd>Use <a href="https://github.com/OnlineFix/Pearipherals/issues">GitHub issues</a> or submit a <a href="https://github.com/OnlineFix/Pearipherals/issues/new?template=compatibility_report.yml">compatibility report</a>. Include product-level details, not serial numbers, Bluetooth addresses or raw HID data. Do not post private configuration or logs without reviewing them.</dd>
+      </dl>
+    </section>
+  </main>
+  <footer>
+    <nav aria-label="Project links">
+      <a href="https://github.com/OnlineFix/Pearipherals">Source</a><a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md">Documentation</a><a href="https://github.com/OnlineFix/Pearipherals/issues">Issues</a><a href="https://github.com/OnlineFix/Pearipherals/blob/main/PRIVACY.md">App privacy</a><a href="https://github.com/OnlineFix/Pearipherals/blob/main/SECURITY.md">Security</a>
+    </nav>
+    <p>This website uses no JavaScript, analytics, cookies or external fonts. It is hosted on GitHub Pages; hosting and linked GitHub pages follow <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub’s privacy practices</a>.</p>
+    <p>Official Pearipherals project website. Pearipherals is not affiliated with, endorsed by or sponsored by Apple Inc. Apple, Magic Keyboard, Magic Trackpad and Studio Display are Apple trademarks, used here to identify hardware.</p>
+  </footer>
+</body>
+</html>
