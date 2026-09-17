@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://onlinefix.github.io/Pearipherals/sitemap.xml
