@@ -53,7 +53,7 @@
   <header>
     <p class="brand">Pearipherals</p>
     <nav aria-label="Main navigation">
-      <a href="#features">Features</a><a href="#setup">Installation</a><a href="#removal">Removal</a><a href="#faq">FAQ</a><a href="https://github.com/OnlineFix/Pearipherals">Source on GitHub</a>
+      <a href="#features">Features</a><a href="#setup">Installation</a><a href="#removal">Removal</a><a href="#comparison">Magic Utilities comparison</a><a href="#faq">FAQ</a><a href="https://github.com/OnlineFix/Pearipherals">Source on GitHub</a>
     </nav>
   </header>
   <main id="main">
@@ -108,22 +108,44 @@
       <p><strong>The separately installed trackpad driver is not removed by deleting Pearipherals.</strong> See the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#uninstall">full removal guide</a> for the manual recovery alternative.</p>
     </section>
 
+    <section id="comparison" aria-labelledby="comparison-title">
+      <h2 id="comparison-title">Pearipherals and Magic Utilities</h2>
+      <p>Looking for a <strong>free, open-source Magic Utilities alternative</strong>? Pearipherals may suit the documented Magic Keyboard and Magic Trackpad 2 Bluetooth setup on Windows 10/11 x64. It provides function-key controls, custom three-finger gestures and battery monitoring under the MIT license.</p>
+      <p><strong>It is not a driver or a feature-for-feature replacement.</strong> Trackpad pointer movement and two-finger scrolling still need the separate mac-precision-touchpad driver. The current Pearipherals beta is unsigned and hardware coverage is still being validated.</p>
+      <p><a href="https://magicutilities.net/">Magic Utilities</a> provides its own Windows drivers and documents Bluetooth and wired USB support, including Magic Mouse support. Check its official device and feature documentation if you need that broader scope. Pearipherals does not claim Magic Mouse support or validated wired USB input. Choose based on your exact hardware, features and security requirements; the products are not interchangeable.</p>
+    </section>
+
     <section id="faq" aria-labelledby="faq-title">
       <h2 id="faq-title">Frequently asked questions</h2>
       <dl>
-        <dt>Can I use Apple Magic Trackpad 2 on Windows 11?</dt>
-        <dd>The mac-precision-touchpad driver supplies normal pointer movement and two-finger scrolling. Pearipherals is a companion for custom three-finger gestures, natural-scrolling control and battery display. The documented setup is Bluetooth on Windows 10/11 x64; it is not a guarantee for every hardware revision.</dd>
-        <dt>Can I use Magic Keyboard F-keys like a Mac?</dt>
-        <dd>Pearipherals provides brightness, Task View, Search, Snipping Tool, media and volume actions. Hold Ctrl, Alt, Shift or Win for the original F-key. The keyboard’s Fn key is not exposed over this Bluetooth path.</dd>
-        <dt>Why is a battery reading missing, or a warning not showing?</dt>
-        <dd>A sleeping or disconnected device may not provide fresh battery data. Missing or stale data is not treated as zero. Notifications also depend on Windows settings and Explorer. Check About / status and the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/README.md#magic-keyboard-and-magic-trackpad-battery-levels">battery documentation</a>.</dd>
-        <dt>Why does Windows show an unknown publisher?</dt>
-        <dd>The current beta is unsigned. The public source and checksum do not substitute for a trusted digital signature. Review the <a href="#unsigned-warning">warning above</a> and do not disable security protections to run it.</dd>
-        <dt>Is it free, and does it upload data?</dt>
-        <dd>Pearipherals is free and <a href="https://github.com/OnlineFix/Pearipherals/blob/main/LICENSE">MIT-licensed</a>, with no paid tier, account, telemetry or automatic uploads. Optional diagnostics are saved locally only when requested, for you to review before sharing. Read the <a href="https://github.com/OnlineFix/Pearipherals/blob/main/PRIVACY.md">application privacy policy</a>.</dd>
-        <dt>Where can I report a problem or working setup?</dt>
-        <dd>Use <a href="https://github.com/OnlineFix/Pearipherals/issues">GitHub issues</a> or submit a <a href="https://github.com/OnlineFix/Pearipherals/issues/new?template=compatibility_report.yml">compatibility report</a>. Include product-level details, not serial numbers, Bluetooth addresses or raw HID data. Do not post private configuration or logs without reviewing them.</dd>
+        <dt>Does Apple Magic Trackpad 2 work on Windows 11?</dt>
+        <dd>The documented setup is Magic Trackpad 2 over Bluetooth on Windows 10/11 x64, with the separately installed mac-precision-touchpad driver for pointer movement and two-finger scrolling. Pearipherals adds custom three-finger gestures, natural-scrolling control and battery display. Not every hardware revision or setup has been validated.</dd>
+        <dt>How do I get Apple Magic Keyboard function keys on Windows?</dt>
+        <dd>Pearipherals gives supported Bluetooth Magic Keyboards Mac-style brightness, Task View, Search, Snipping Tool, media and volume actions. F5 passes through unchanged. Hold Ctrl, Alt, Shift or Win to send the original F-key. The Fn key is not exposed over this Bluetooth path.</dd>
+        <dt>How can I check Magic Keyboard and Magic Trackpad battery levels on Windows?</dt>
+        <dd>Open the Pearipherals tray menu to see separate keyboard and trackpad battery readings when supported devices provide data. Low-battery notifications trigger on fresh readings at 20% or below, with one critical escalation at 5% or below. Warnings are best effort, not a guarantee before a battery dies.</dd>
+        <dt>Why is a battery reading missing or a low-battery alert not showing?</dt>
+        <dd>Sleeping or disconnected devices may not provide fresh data. Missing or stale readings are not treated as zero. Windows notification settings, Do Not Disturb and Explorer can suppress alerts. Check About / status in the tray; the app must be running and receiving fresh readings.</dd>
+        <dt>Is Pearipherals a free, open-source alternative to Magic Utilities?</dt>
+        <dd>Pearipherals may suit people looking for free function-key controls, custom three-finger gestures and battery monitoring for the documented Bluetooth setup. It is MIT-licensed, with no paid tier. It is not a feature-for-feature replacement or a trackpad driver: Magic Trackpad 2 still needs the separate mac-precision-touchpad driver. The current Pearipherals beta is unsigned and not every hardware revision has been validated.</dd>
+        <dt>Does Pearipherals replace a Windows Magic Trackpad driver?</dt>
+        <dd>No. It is a companion utility and does not bundle or replace mac-precision-touchpad. Install that driver separately for Magic Trackpad 2 pointer movement and two-finger scrolling. Keyboard mappings, battery display and monitor controls do not require the trackpad driver.</dd>
+        <dt>Are USB-C models, wired USB and Windows on ARM supported?</dt>
+        <dd>The documented setup is Bluetooth on Windows 10/11 x64. USB-C hardware revisions, wired USB input and Windows on ARM are not claimed as validated. Do not assume support from the Magic Keyboard or Magic Trackpad product name alone.</dd>
+        <dt>Can I use three-finger gestures and change scrolling direction?</dt>
+        <dd>Choose Swipes for down to minimize, up to restore and left/right for Task View; choose Drag for three-finger dragging and text selection, or Off. The natural-scrolling toggle requires a trackpad reconnect or reboot. Four-finger gestures are not handled.</dd>
+        <dt>Can I control Apple Studio Display brightness on Windows?</dt>
+        <dd>Pearipherals tries Apple Studio Display USB HID control, then DDC/CI for compatible monitors, then GPU gamma-ramp dimming. Results depend on the display and connection. A video-only USB-C-to-DisplayPort cable carries no USB control data; gamma dimming is a software fallback, not native backlight control.</dd>
+        <dt>Why does Windows show an unknown publisher or block the EXE?</dt>
+        <dd>The current v1.2.1 beta is unsigned, so Windows cannot verify its publisher. SmartScreen may warn and Smart App Control may block it without a per-app exception. Do not disable system-wide security protections. Public source and a SHA-256 checksum do not replace a trusted digital signature or guarantee safety.</dd>
+        <dt>Does Pearipherals collect data or require an account?</dt>
+        <dd>No account is required. The app has no telemetry or automatic uploads. Optional diagnostic reports are saved locally only when requested, for you to review before choosing to share them.</dd>
+        <dt>How do I uninstall Pearipherals and undo its changes?</dt>
+        <dd>Use Prepare for removal from the tray and inspect every result. Resolve restoration failures before deleting your settings backup, then choose Quit and delete the EXE and adjacent runtime files. First launch enables autostart and applies touchpad settings; removal restores the backed-up settings and removes startup entries. The separate trackpad driver is not removed.</dd>
+        <dt>Where can I report a working setup or a problem?</dt>
+        <dd>Use the GitHub compatibility report form for working or failing setups, or the bug report form for a problem. Include your Windows version, product model, connection type and what worked or failed. Do not share serial numbers, Bluetooth addresses or raw HID data; review any diagnostics before posting.</dd>
       </dl>
+      <p><a href="https://github.com/OnlineFix/Pearipherals/issues/new?template=compatibility_report.yml">Report a working or failing setup</a> · <a href="https://github.com/OnlineFix/Pearipherals/issues/new?template=bug_report.yml">Report a bug</a></p>
     </section>
   </main>
   <footer>
