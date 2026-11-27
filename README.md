@@ -28,6 +28,10 @@ v1.1.
 
 ## Features
 
+<img src="docs/tray-menu.png" width="325" alt="Pearipherals tray menu showing keyboard controls, three-finger gestures and both battery levels">
+
+Right-click the tray icon to check both batteries or change a gesture. Already tried it? [Share what worked on your setup](https://github.com/OnlineFix/Pearipherals/issues/new?template=compatibility_report.yml) to help someone with the same hardware.
+
 | Feature | What it does |
 |---|---|
 | **"Tragic" Keyboard** | Mac-style function row for an Apple Magic Keyboard on Windows |
